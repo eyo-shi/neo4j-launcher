@@ -31,6 +31,7 @@ def _render_status_page(info: dict) -> str:
         ("Username", info.get("username")),
         ("Password", info.get("password")),
         ("Neo4j Browser", info.get("proxied_browser_path")),
+        ("HTTP API Connect URL", info.get("http_api_connect_url")),
         ("Internal Bolt URI", info.get("internal_bolt")),
         ("Internal Browser", info.get("internal_browser")),
         ("External Bolt URI", info.get("external_bolt")),
@@ -77,7 +78,7 @@ def _render_status_page(info: dict) -> str:
 <body>
   <h1>Neo4j Launcher</h1>
   <p>Neo4j deployment status and connection details.</p>
-  <p>Use <strong>Open Neo4j Browser</strong> below. The external LoadBalancer URL often does not work from corporate networks.</p>
+  <p>Use <strong>Open Neo4j Browser</strong> below. On the connect screen, choose <code>https://</code> and enter the <strong>HTTP API Connect URL</strong> shown below. Do not use the external LoadBalancer Bolt URL from your browser.</p>
   <table>
     {''.join(table_rows)}
   </table>

@@ -367,6 +367,27 @@ def configure_external_advertised_addresses() -> None:
     )
 
 
+def get_cml_application_base_url() -> str | None:
+    domain = os.getenv("CDSW_DOMAIN")
+    engine_id = os.getenv("CDSW_ENGINE_ID")
+    subdomain = os.getenv("NEO4J_LAUNCHER_SUBDOMAIN", "neo4j-launcher")
+    if domain and engine_id:
+        return f"https://{subdomain}-{engine_id}.{domain}"
+    return None
+
+
+def build_proxied_browser_path(_external_bolt: str | None = None) -> str:
+    from urllib.parse import quote
+
+    base_url = get_cml_application_base_url()
+    if not base_url:
+        return "/browser/"
+
+    # Use HTTPS Query API via the CML application proxy instead of external Bolt.
+    connect_url = f"{base_url}/"
+    return f"/browser/?connectURL={quote(connect_url, safe='')}"
+
+
 def get_internal_browser_url() -> str | None:
     try:
         return get_external_endpoints()["internal_browser"]
@@ -387,6 +408,7 @@ def get_connection_info() -> dict:
         "service_type": None,
         "port_forward_command": None,
         "proxied_browser_path": "/browser/",
+        "http_api_connect_url": None,
     }
 
     try:
@@ -409,6 +431,10 @@ def get_connection_info() -> dict:
         info["port_forward_command"] = (
             f"kubectl port-forward svc/{get_neo4j_service_name()} 7474:7474 7687:7687"
         )
+    info["proxied_browser_path"] = build_proxied_browser_path()
+    info["http_api_connect_url"] = get_cml_application_base_url()
+    if info["http_api_connect_url"]:
+        info["http_api_connect_url"] = f"{info['http_api_connect_url']}/"
     return info
 
 
@@ -425,6 +451,8 @@ def print_connection_info() -> None:
     if info["external_browser"]:
         print(f"External Browser:  {info['external_browser']}")
     print(f"Proxied Browser:   {info['proxied_browser_path']}")
+    if info["http_api_connect_url"]:
+        print(f"HTTP API Connect:  {info['http_api_connect_url']}")
     if info["port_forward_command"]:
         print("Service type is ClusterIP. Use port-forward for external access:")
         print(f"  {info['port_forward_command']}")
