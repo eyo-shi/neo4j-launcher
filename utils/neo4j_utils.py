@@ -127,6 +127,14 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                                     name="NEO4J_PLUGINS",
                                     value='["apoc","graph-data-science"]',
                                 ),
+                                client.V1EnvVar(
+                                    name="NEO4J_server_http_listen__address",
+                                    value="0.0.0.0:7474",
+                                ),
+                                client.V1EnvVar(
+                                    name="NEO4J_server_bolt_listen__address",
+                                    value="0.0.0.0:7687",
+                                ),
                             ],
                             resources=client.V1ResourceRequirements(
                                 requests={"cpu": "1", "memory": "4Gi"},
@@ -178,6 +186,13 @@ def create_service_spec_for_neo4j() -> client.V1Service:
         bolt_port.node_port = NEO4J_NODE_PORT_BOLT
         http_port.node_port = NEO4J_NODE_PORT_HTTP
 
+    annotations = {}
+    if NEO4J_SERVICE_TYPE == "LoadBalancer":
+        annotations = {
+            "service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol": "TCP",
+            "service.beta.kubernetes.io/aws-load-balancer-healthcheck-port": "7687",
+        }
+
     return client.V1Service(
         api_version="v1",
         metadata=client.V1ObjectMeta(
@@ -185,6 +200,7 @@ def create_service_spec_for_neo4j() -> client.V1Service:
             labels={"app": get_deployment_name()},
             owner_references=[get_owner_reference()],
             namespace=namespace,
+            annotations=annotations or None,
         ),
         spec=client.V1ServiceSpec(
             type=NEO4J_SERVICE_TYPE,
@@ -304,6 +320,60 @@ def wait_for_external_endpoint(max_retries: int = 30, sleep_duration: int = 10) 
     return get_external_endpoints()
 
 
+def _advertised_address(endpoint: str | None) -> str | None:
+    if not endpoint:
+        return None
+    from urllib.parse import urlparse
+
+    parsed = urlparse(endpoint)
+    return parsed.netloc or None
+
+
+def configure_external_advertised_addresses() -> None:
+    endpoints = get_external_endpoints()
+    http_address = _advertised_address(endpoints.get("external_browser"))
+    bolt_address = _advertised_address(endpoints.get("external_bolt"))
+    if not http_address and not bolt_address:
+        return
+
+    api_instance = client.AppsV1Api()
+    deployment = api_instance.read_namespaced_deployment(
+        name=get_deployment_name(),
+        namespace=get_current_namespace(),
+    )
+    container = deployment.spec.template.spec.containers[0]
+    env_by_name = {env.name: env for env in container.env}
+
+    if http_address:
+        env_by_name["NEO4J_server_http_advertised__address"] = client.V1EnvVar(
+            name="NEO4J_server_http_advertised__address",
+            value=http_address,
+        )
+    if bolt_address:
+        env_by_name["NEO4J_server_bolt_advertised__address"] = client.V1EnvVar(
+            name="NEO4J_server_bolt_advertised__address",
+            value=bolt_address,
+        )
+
+    container.env = list(env_by_name.values())
+    api_instance.patch_namespaced_deployment(
+        name=get_deployment_name(),
+        namespace=get_current_namespace(),
+        body=deployment,
+    )
+    print(
+        "Configured Neo4j advertised addresses for external access: "
+        f"http={http_address}, bolt={bolt_address}"
+    )
+
+
+def get_internal_browser_url() -> str | None:
+    try:
+        return get_external_endpoints()["internal_browser"]
+    except Exception:
+        return None
+
+
 def get_connection_info() -> dict:
     credentials = get_neo4j_credentials()
     info = {
@@ -316,6 +386,7 @@ def get_connection_info() -> dict:
         "external_browser": None,
         "service_type": None,
         "port_forward_command": None,
+        "proxied_browser_path": "/browser/",
     }
 
     try:
@@ -353,6 +424,7 @@ def print_connection_info() -> None:
         print(f"External Bolt URI: {info['external_bolt']}")
     if info["external_browser"]:
         print(f"External Browser:  {info['external_browser']}")
+    print(f"Proxied Browser:   {info['proxied_browser_path']}")
     if info["port_forward_command"]:
         print("Service type is ClusterIP. Use port-forward for external access:")
         print(f"  {info['port_forward_command']}")
@@ -372,7 +444,13 @@ def run_neo4j_supervisor() -> None:
             reset_neo4j_server()
 
     wait_for_neo4j_server()
-    wait_for_external_endpoint()
+    endpoints = wait_for_external_endpoint()
+    if endpoints.get("external_browser") or endpoints.get("external_bolt"):
+        try:
+            configure_external_advertised_addresses()
+            wait_for_neo4j_server()
+        except Exception as exc:
+            print(f"Failed to configure external advertised addresses: {exc}")
     print_connection_info()
 
     print("Neo4j is running. Monitoring in background.")

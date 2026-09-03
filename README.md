@@ -75,6 +75,8 @@ flowchart TB
 
 アプリケーションは CML のヘルスチェック要件を満たすため、`CDSW_APP_PORT` でステータスページを公開します。Status が **Running** になると、アプリケーション名から接続情報ページを開けます。
 
+**Neo4j Browser** はステータスページの **Open Neo4j Browser**（`/browser/`）から開いてください。External Browser の LoadBalancer URL は、企業ネットワークや AWS セキュリティグループの制限でブラウザから到達できない場合があります。
+
 ## 接続方法
 
 アプリケーション起動後、ログに接続情報が表示されます。

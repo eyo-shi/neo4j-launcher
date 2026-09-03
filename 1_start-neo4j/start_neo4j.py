@@ -1,9 +1,27 @@
 import html
 import os
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urljoin
 
-from utils.neo4j_utils import get_connection_info, run_neo4j_supervisor
+from utils.neo4j_utils import (
+    get_connection_info,
+    get_internal_browser_url,
+    run_neo4j_supervisor,
+)
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
 
 
 def _render_status_page(info: dict) -> str:
@@ -12,6 +30,7 @@ def _render_status_page(info: dict) -> str:
         ("Status", status),
         ("Username", info.get("username")),
         ("Password", info.get("password")),
+        ("Neo4j Browser", info.get("proxied_browser_path")),
         ("Internal Bolt URI", info.get("internal_bolt")),
         ("Internal Browser", info.get("internal_browser")),
         ("External Bolt URI", info.get("external_bolt")),
@@ -25,8 +44,17 @@ def _render_status_page(info: dict) -> str:
     for label, value in rows:
         if not value:
             continue
-        if label == "External Browser" and value.startswith("http"):
-            cell = f'<a href="{html.escape(value)}" target="_blank" rel="noopener noreferrer">{html.escape(value)}</a>'
+        if label == "Neo4j Browser":
+            cell = (
+                f'<a href="{html.escape(value)}">Open Neo4j Browser</a> '
+                "(recommended)"
+            )
+        elif label == "External Browser" and str(value).startswith("http"):
+            cell = (
+                f'<a href="{html.escape(value)}" target="_blank" '
+                f'rel="noopener noreferrer">{html.escape(value)}</a> '
+                "(may be blocked by network policy)"
+            )
         else:
             cell = f"<code>{html.escape(str(value))}</code>"
         table_rows.append(
@@ -49,6 +77,7 @@ def _render_status_page(info: dict) -> str:
 <body>
   <h1>Neo4j Launcher</h1>
   <p>Neo4j deployment status and connection details.</p>
+  <p>Use <strong>Open Neo4j Browser</strong> below. The external LoadBalancer URL often does not work from corporate networks.</p>
   <table>
     {''.join(table_rows)}
   </table>
@@ -58,6 +87,27 @@ def _render_status_page(info: dict) -> str:
 
 class Neo4jLauncherHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        self._handle_request("GET")
+
+    def do_POST(self) -> None:
+        self._handle_request("POST")
+
+    def do_PUT(self) -> None:
+        self._handle_request("PUT")
+
+    def do_DELETE(self) -> None:
+        self._handle_request("DELETE")
+
+    def do_OPTIONS(self) -> None:
+        self._handle_request("OPTIONS")
+
+    def _handle_request(self, method: str) -> None:
+        if self.path == "/" or self.path.startswith("/?"):
+            self._serve_status_page()
+            return
+        self._proxy_request(method)
+
+    def _serve_status_page(self) -> None:
         page = _render_status_page(get_connection_info())
         body = page.encode("utf-8")
         self.send_response(200)
@@ -65,6 +115,43 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _proxy_request(self, method: str) -> None:
+        internal_browser = get_internal_browser_url()
+        if not internal_browser:
+            self.send_error(503, "Neo4j Browser is not ready yet")
+            return
+
+        target_url = urljoin(f"{internal_browser.rstrip('/')}/", self.path.lstrip("/"))
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length else None
+
+        request = urllib.request.Request(target_url, data=body, method=method)
+        for header, value in self.headers.items():
+            if header.lower() not in HOP_BY_HOP_HEADERS and header.lower() != "host":
+                request.add_header(header, value)
+
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                self.send_response(response.status)
+                for header, value in response.headers.items():
+                    if header.lower() not in HOP_BY_HOP_HEADERS:
+                        self.send_header(header, value)
+                self.end_headers()
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except urllib.error.HTTPError as exc:
+            self.send_response(exc.code)
+            for header, value in exc.headers.items():
+                if header.lower() not in HOP_BY_HOP_HEADERS:
+                    self.send_header(header, value)
+            self.end_headers()
+            self.wfile.write(exc.read())
+        except Exception as exc:
+            self.send_error(502, f"Failed to proxy Neo4j Browser request: {exc}")
 
     def log_message(self, format: str, *args) -> None:
         return
