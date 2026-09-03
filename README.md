@@ -67,6 +67,8 @@ flowchart TB
 | `NEO4J_NODE_PORT_BOLT` | `30687` | NodePort（Bolt） |
 | `NEO4J_NODE_PORT_HTTP` | `30474` | NodePort（Browser） |
 | `NEO4J_IMAGE` | `neo4j:2026.07.1` | Neo4j イメージ |
+| `NEO4J_MEMORY` | `4Gi` | Neo4j Pod のメモリ（APOC/GDS 利用時は 4Gi 推奨） |
+| `NEO4J_STARTUP_TIMEOUT_SECONDS` | `1200` | 初回起動の待機時間（秒）。APOC/GDS のダウンロードに 10〜20 分かかることがあります |
 
 ### AMP タスク
 

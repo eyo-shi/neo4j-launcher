@@ -1,6 +1,8 @@
 import os
 import socket
 import time
+import urllib.error
+import urllib.request
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -18,7 +20,10 @@ NEO4J_IMAGE = os.getenv("NEO4J_IMAGE") or "neo4j:2026.07.1"
 NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE") or "LoadBalancer"
 NEO4J_NODE_PORT_BOLT = int(os.getenv("NEO4J_NODE_PORT_BOLT") or "30687")
 NEO4J_NODE_PORT_HTTP = int(os.getenv("NEO4J_NODE_PORT_HTTP") or "30474")
-NEO4J_MEMORY = os.getenv("NEO4J_MEMORY") or "2Gi"
+NEO4J_MEMORY = os.getenv("NEO4J_MEMORY") or "4Gi"
+NEO4J_STARTUP_TIMEOUT_SECONDS = int(
+    os.getenv("NEO4J_STARTUP_TIMEOUT_SECONDS") or "1200"
+)
 
 
 def get_current_namespace() -> str:
@@ -93,7 +98,7 @@ def get_neo4j_credentials() -> dict:
     return {
         "username": username,
         "password": password,
-        "uri": f"bolt://{get_neo4j_service_name()}.{get_current_namespace()}:7687",
+        "uri": f"bolt://{get_neo4j_service_name()}:7687",
         "database": "neo4j",
     }
 
@@ -113,6 +118,84 @@ def get_neo4j_service_name() -> str:
 
 def get_deployment_name() -> str:
     return f"neo4j-{get_engine_id()}"
+
+
+def get_cml_application_base_url() -> str | None:
+    domain = os.getenv("CDSW_DOMAIN")
+    engine_id = os.getenv("CDSW_ENGINE_ID")
+    subdomain = os.getenv("NEO4J_LAUNCHER_SUBDOMAIN", "neo4j-launcher")
+    if domain and engine_id:
+        return f"https://{subdomain}-{engine_id}.{domain}"
+    return None
+
+
+def _cml_proxy_http_advertised_address() -> str | None:
+    base_url = get_cml_application_base_url()
+    if not base_url:
+        return None
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    if not parsed.hostname:
+        return None
+    if parsed.port:
+        return f"{parsed.hostname}:{parsed.port}"
+    if parsed.scheme == "https":
+        return f"{parsed.hostname}:443"
+    return parsed.hostname
+
+
+def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
+    env = [
+        client.V1EnvVar(
+            name="NEO4J_AUTH",
+            value=f"{credentials['username']}/{credentials['password']}",
+        ),
+        client.V1EnvVar(name="NEO4J_apoc_export_file_enabled", value="true"),
+        client.V1EnvVar(name="NEO4J_apoc_import_file_enabled", value="true"),
+        client.V1EnvVar(
+            name="NEO4J_apoc_import_file_use__neo4j__config",
+            value="true",
+        ),
+        client.V1EnvVar(
+            name="NEO4J_PLUGINS",
+            value='["apoc","graph-data-science"]',
+        ),
+        client.V1EnvVar(
+            name="NEO4J_server_http_listen__address",
+            value="0.0.0.0:7474",
+        ),
+        client.V1EnvVar(
+            name="NEO4J_server_bolt_listen__address",
+            value="0.0.0.0:7687",
+        ),
+        client.V1EnvVar(
+            name="NEO4J_server_http_x__forward__enabled",
+            value="true",
+        ),
+        client.V1EnvVar(
+            name="NEO4J_server_memory_heap_initial__size",
+            value=os.getenv("NEO4J_HEAP_INITIAL") or "1G",
+        ),
+        client.V1EnvVar(
+            name="NEO4J_server_memory_heap_max__size",
+            value=os.getenv("NEO4J_HEAP_MAX") or "2G",
+        ),
+        client.V1EnvVar(
+            name="NEO4J_server_memory_pagecache_size",
+            value=os.getenv("NEO4J_PAGECACHE") or "1G",
+        ),
+    ]
+    proxy_http_address = _cml_proxy_http_advertised_address()
+    if proxy_http_address:
+        env.append(
+            client.V1EnvVar(
+                name="NEO4J_server_http_advertised__address",
+                value=proxy_http_address,
+            )
+        )
+    return env
 
 
 def create_deployment_spec_for_neo4j() -> client.V1Deployment:
@@ -152,41 +235,19 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                                     container_port=7474, name="http"
                                 ),
                             ],
-                            env=[
-                                client.V1EnvVar(
-                                    name="NEO4J_AUTH",
-                                    value=f"{credentials['username']}/{credentials['password']}",
-                                ),
-                                client.V1EnvVar(
-                                    name="NEO4J_apoc_export_file_enabled", value="true"
-                                ),
-                                client.V1EnvVar(
-                                    name="NEO4J_apoc_import_file_enabled", value="true"
-                                ),
-                                client.V1EnvVar(
-                                    name="NEO4J_apoc_import_file_use__neo4j__config",
-                                    value="true",
-                                ),
-                                client.V1EnvVar(
-                                    name="NEO4J_PLUGINS",
-                                    value='["apoc","graph-data-science"]',
-                                ),
-                                client.V1EnvVar(
-                                    name="NEO4J_server_http_listen__address",
-                                    value="0.0.0.0:7474",
-                                ),
-                                client.V1EnvVar(
-                                    name="NEO4J_server_bolt_listen__address",
-                                    value="0.0.0.0:7687",
-                                ),
-                                client.V1EnvVar(
-                                    name="NEO4J_server_http_x__forward__enabled",
-                                    value="true",
-                                ),
-                            ],
+                            env=_neo4j_container_env(credentials),
                             resources=client.V1ResourceRequirements(
                                 requests={"cpu": "1", "memory": NEO4J_MEMORY},
-                                limits={"cpu": "1", "memory": NEO4J_MEMORY},
+                                limits={"cpu": "2", "memory": NEO4J_MEMORY},
+                            ),
+                            readiness_probe=client.V1Probe(
+                                http_get=client.V1HTTPGetAction(
+                                    path="/",
+                                    port=7474,
+                                ),
+                                initial_delay_seconds=30,
+                                period_seconds=10,
+                                failure_threshold=60,
                             ),
                             volume_mounts=[
                                 client.V1VolumeMount(
@@ -387,10 +448,28 @@ def _ensure_clean_slate() -> None:
         print("Existing Neo4j deployment is healthy. Reusing it.")
         return
 
+    pod_status = get_deployment_diagnostics().get("neo4j_pod_status") or ""
+    failure_markers = (
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "Error",
+        "OOMKilled",
+    )
+    if deployment and service and not any(
+        marker in pod_status for marker in failure_markers
+    ):
+        print(
+            "Neo4j resources already exist and pods are still starting. "
+            f"Reusing deployment. Pod status: {pod_status}"
+        )
+        return
+
     print(
         "Cleaning up stale Neo4j resources before redeploying "
         f"(deployment={'yes' if deployment else 'no'}, "
-        f"service={'yes' if service else 'no'})..."
+        f"service={'yes' if service else 'no'}, "
+        f"pod_status={pod_status})..."
     )
     _delete_all_neo4j_resources()
     _wait_until_all_neo4j_resources_gone()
@@ -576,31 +655,65 @@ def reset_neo4j_server() -> None:
     deploy_neo4j_server()
 
 
+def is_neo4j_http_up() -> bool:
+    if not service_exists():
+        return False
+    for candidate in _internal_browser_url_candidates():
+        try:
+            urllib.request.urlopen(f"{candidate.rstrip('/')}/", timeout=5)
+            return True
+        except (urllib.error.URLError, TimeoutError, OSError):
+            continue
+    return False
+
+
 def is_neo4j_server_up() -> bool:
     credentials = get_neo4j_credentials()
-    with GraphDatabase.driver(
-        credentials["uri"], auth=(credentials["username"], credentials["password"])
-    ) as driver:
-        try:
+    try:
+        with GraphDatabase.driver(
+            credentials["uri"],
+            auth=(credentials["username"], credentials["password"]),
+            connection_timeout=5,
+        ) as driver:
             driver.verify_connectivity()
             return True
-        except Exception:
-            return False
+    except Exception:
+        return False
 
 
-def wait_for_neo4j_server(max_retries: int = 30, sleep_duration: int = 10) -> None:
+def wait_for_neo4j_server(
+    max_retries: int | None = None, sleep_duration: int = 10
+) -> None:
+    if max_retries is None:
+        max_retries = max(1, NEO4J_STARTUP_TIMEOUT_SECONDS // sleep_duration)
+
     credentials = get_neo4j_credentials()
     with GraphDatabase.driver(
-        credentials["uri"], auth=(credentials["username"], credentials["password"])
+        credentials["uri"],
+        auth=(credentials["username"], credentials["password"]),
+        connection_timeout=5,
     ) as driver:
-        for _ in range(max_retries):
+        for attempt in range(max_retries):
             try:
                 driver.verify_connectivity()
                 return
-            except Exception as e:
-                print(f"Neo4j server is not ready yet. Retrying... {e}")
+            except Exception as exc:
+                print(
+                    f"Neo4j server is not ready yet "
+                    f"({attempt + 1}/{max_retries}): {exc}"
+                )
+                if attempt % 6 == 5:
+                    diagnostics = get_deployment_diagnostics()
+                    print(
+                        "Current pod status: "
+                        f"{diagnostics.get('neo4j_pod_status')}"
+                    )
                 time.sleep(sleep_duration)
-    raise RuntimeError("Neo4j server is not ready yet. Max retries exceeded.")
+    diagnostics = get_deployment_diagnostics()
+    raise RuntimeError(
+        "Neo4j server is not ready yet. Max retries exceeded. "
+        f"Pod status: {diagnostics.get('neo4j_pod_status')}"
+    )
 
 
 def get_external_endpoints() -> dict:
@@ -675,37 +788,31 @@ def configure_external_advertised_addresses() -> None:
     )
 
 
-def _cml_proxy_http_advertised_address() -> str | None:
-    base_url = get_cml_application_base_url()
-    if not base_url:
-        return None
-
-    from urllib.parse import urlparse
-
-    parsed = urlparse(base_url)
-    if not parsed.hostname:
-        return None
-    if parsed.port:
-        return f"{parsed.hostname}:{parsed.port}"
-    if parsed.scheme == "https":
-        return f"{parsed.hostname}:443"
-    return parsed.hostname
-
-
 def configure_connectivity_addresses() -> None:
     proxy_http_address = _cml_proxy_http_advertised_address()
-    if proxy_http_address:
-        _patch_neo4j_advertised_addresses(
-            http_address=proxy_http_address,
-            bolt_address=None,
-        )
-        print(
-            "Configured Neo4j HTTP advertised address for CML application proxy: "
-            f"http={proxy_http_address}"
-        )
+    if not proxy_http_address:
+        configure_external_advertised_addresses()
         return
 
-    configure_external_advertised_addresses()
+    deployment = client.AppsV1Api().read_namespaced_deployment(
+        name=get_deployment_name(),
+        namespace=get_current_namespace(),
+    )
+    container = deployment.spec.template.spec.containers[0]
+    env_by_name = {env.name: env for env in container.env}
+    current_http = env_by_name.get("NEO4J_server_http_advertised__address")
+    if current_http and current_http.value == proxy_http_address:
+        print("Neo4j HTTP advertised address already configured.")
+        return
+
+    _patch_neo4j_advertised_addresses(
+        http_address=proxy_http_address,
+        bolt_address=None,
+    )
+    print(
+        "Configured Neo4j HTTP advertised address for CML application proxy: "
+        f"http={proxy_http_address}"
+    )
 
 
 def _patch_neo4j_advertised_addresses(
@@ -751,15 +858,6 @@ def _patch_neo4j_advertised_addresses(
     )
 
 
-def get_cml_application_base_url() -> str | None:
-    domain = os.getenv("CDSW_DOMAIN")
-    engine_id = os.getenv("CDSW_ENGINE_ID")
-    subdomain = os.getenv("NEO4J_LAUNCHER_SUBDOMAIN", "neo4j-launcher")
-    if domain and engine_id:
-        return f"https://{subdomain}-{engine_id}.{domain}"
-    return None
-
-
 def build_proxied_browser_path(_external_bolt: str | None = None) -> str:
     from urllib.parse import quote
 
@@ -791,7 +889,7 @@ def _can_resolve_host(host: str) -> bool:
 
 
 def get_internal_browser_url() -> str | None:
-    if not service_exists() or not is_neo4j_server_up():
+    if not is_neo4j_http_up():
         return None
 
     for candidate in _internal_browser_url_candidates():
@@ -853,11 +951,23 @@ def get_connection_info() -> dict:
         )
 
     if not is_neo4j_server_up():
+        http_ready = is_neo4j_http_up()
         if not info.get("message"):
-            info["message"] = (
-                "Neo4j service exists but the database is still starting. "
-                "This page refreshes every 10 seconds."
-            )
+            if http_ready:
+                info["message"] = (
+                    "Neo4j HTTP is up but Bolt is not ready yet. "
+                    "APOC/GDS plugin download can take several minutes on first start."
+                )
+            else:
+                info["message"] = (
+                    "Neo4j service exists but the database is still starting. "
+                    "First startup with APOC/GDS can take 10-20 minutes."
+                )
+        if http_ready:
+            info["proxied_browser_path"] = build_proxied_browser_path()
+            info["http_api_connect_url"] = get_cml_application_base_url()
+            if info["http_api_connect_url"]:
+                info["http_api_connect_url"] = f"{info['http_api_connect_url']}/"
         return info
 
     info["status"] = "running"
@@ -907,11 +1017,21 @@ def _bootstrap_neo4j() -> None:
     deploy_neo4j_server()
 
     _set_supervisor_state("waiting_for_neo4j")
-    wait_for_neo4j_server()
-    endpoints = wait_for_external_endpoint()
+    try:
+        wait_for_neo4j_server()
+    except RuntimeError as exc:
+        if is_neo4j_http_up():
+            print(
+                "Bolt is not ready yet, but Neo4j HTTP is responding. "
+                f"Continuing startup: {exc}"
+            )
+        else:
+            raise
+    wait_for_external_endpoint()
     try:
         configure_connectivity_addresses()
-        wait_for_neo4j_server()
+        if not is_neo4j_server_up():
+            wait_for_neo4j_server(max_retries=30)
     except Exception as exc:
         print(f"Failed to configure Neo4j connectivity addresses: {exc}")
     print_connection_info()
@@ -927,6 +1047,9 @@ def run_neo4j_supervisor() -> None:
             print("Neo4j is running. Monitoring in background.")
             while True:
                 if not is_neo4j_server_up():
+                    if is_neo4j_http_up():
+                        time.sleep(30)
+                        continue
                     print("Neo4j server is down. Attempting to restart...")
                     _set_supervisor_state("restarting")
                     reset_neo4j_server()
@@ -937,4 +1060,4 @@ def run_neo4j_supervisor() -> None:
         except Exception as exc:
             print(f"Neo4j supervisor error: {exc}")
             _set_supervisor_state("error", str(exc))
-            time.sleep(30)
+            time.sleep(60)
