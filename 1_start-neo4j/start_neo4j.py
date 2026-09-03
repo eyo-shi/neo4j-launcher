@@ -23,6 +23,14 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
+FORWARDED_HEADERS = {
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "forwarded",
+}
+
 
 def _render_status_page(info: dict) -> str:
     status = html.escape(info.get("status", "starting"))
@@ -83,8 +91,8 @@ def _render_status_page(info: dict) -> str:
 </head>
 <body>
   <h1>Neo4j Launcher</h1>
-  <p>Neo4j deployment status and connection details.</p>
-  <p>Wait until <strong>Status</strong> becomes <code>running</code> before opening Neo4j Browser. If it stays <code>starting</code> for more than a few minutes, check <strong>Deployment</strong>, <strong>Service</strong>, and <strong>Message</strong> below, and review the Application logs in CML.</p>
+  <p>Deployment status is shown here. Neo4j Browser connects through this application URL using the HTTPS Query API.</p>
+  <p>Wait until <strong>Status</strong> becomes <code>running</code>, then open <strong>Open Neo4j Browser</strong>. On the connect screen, use protocol <code>https://</code> and paste the full <strong>HTTP API Connect URL</strong> below.</p>
   <table>
     {''.join(table_rows)}
   </table>
@@ -113,7 +121,7 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         if path in ("/health", "/healthz"):
             self._serve_health_check()
             return
-        if path == "/":
+        if path in ("/launcher", "/launcher/"):
             self._serve_status_page()
             return
         self._proxy_request(method)
@@ -149,14 +157,28 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length) if content_length else None
 
         request = urllib.request.Request(target_url, data=body, method=method)
+        forwarded_host = None
+        forwarded_proto = None
         for header, value in self.headers.items():
             header_lower = header.lower()
             if header_lower in HOP_BY_HOP_HEADERS or header_lower == "host":
                 continue
+            if header_lower in FORWARDED_HEADERS:
+                if header_lower == "x-forwarded-host":
+                    forwarded_host = value
+                if header_lower == "x-forwarded-proto":
+                    forwarded_proto = value
             request.add_header(header, value)
 
         parsed_target = urlparse(target_url)
         request.add_header("Host", parsed_target.netloc)
+        if not forwarded_host:
+            forwarded_host = self.headers.get("Host")
+        if forwarded_host:
+            request.add_header("X-Forwarded-Host", forwarded_host)
+        if not forwarded_proto:
+            forwarded_proto = "https"
+        request.add_header("X-Forwarded-Proto", forwarded_proto)
 
         try:
             with urllib.request.urlopen(request, timeout=120) as response:

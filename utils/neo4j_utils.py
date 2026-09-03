@@ -3,6 +3,7 @@ import socket
 import time
 
 from kubernetes import client, config
+from kubernetes.client.rest import ApiException
 from neo4j import GraphDatabase
 
 config.load_incluster_config()
@@ -178,6 +179,10 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                                     name="NEO4J_server_bolt_listen__address",
                                     value="0.0.0.0:7687",
                                 ),
+                                client.V1EnvVar(
+                                    name="NEO4J_server_http_x__forward__enabled",
+                                    value="true",
+                                ),
                             ],
                             resources=client.V1ResourceRequirements(
                                 requests={"cpu": "1", "memory": NEO4J_MEMORY},
@@ -281,6 +286,148 @@ def _format_k8s_error(exc: Exception) -> str:
     return str(exc)
 
 
+def _get_deployment() -> client.V1Deployment | None:
+    try:
+        return client.AppsV1Api().read_namespaced_deployment(
+            name=get_deployment_name(),
+            namespace=get_current_namespace(),
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def _get_service() -> client.V1Service | None:
+    try:
+        return client.CoreV1Api().read_namespaced_service(
+            name=get_neo4j_service_name(),
+            namespace=get_current_namespace(),
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def _delete_if_exists(delete_fn, resource_name: str) -> None:
+    try:
+        delete_fn()
+        print(f"Deleted {resource_name}")
+    except ApiException as exc:
+        if exc.status != 404:
+            print(f"Failed to delete {resource_name}: {_format_k8s_error(exc)}")
+            raise
+
+
+def _wait_until_gone(
+    getter,
+    resource_name: str,
+    timeout_seconds: int = 180,
+    sleep_seconds: int = 5,
+) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            obj = getter()
+            if obj is None:
+                return
+            deleting = bool(obj.metadata.deletion_timestamp)
+            print(
+                f"Waiting for {resource_name} to be removed "
+                f"(deleting={deleting})..."
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return
+            raise
+        time.sleep(sleep_seconds)
+    raise RuntimeError(
+        f"Timed out waiting for {resource_name} to be deleted after "
+        f"{timeout_seconds}s"
+    )
+
+
+def _delete_all_neo4j_resources() -> None:
+    namespace = get_current_namespace()
+    apps_api = client.AppsV1Api()
+    core_api = client.CoreV1Api()
+    delete_options = client.V1DeleteOptions(propagation_policy="Foreground")
+
+    _delete_if_exists(
+        lambda: apps_api.delete_namespaced_deployment(
+            name=get_deployment_name(),
+            namespace=namespace,
+            body=delete_options,
+        ),
+        get_deployment_name(),
+    )
+    _delete_if_exists(
+        lambda: core_api.delete_namespaced_service(
+            name=get_neo4j_service_name(),
+            namespace=namespace,
+        ),
+        get_neo4j_service_name(),
+    )
+
+
+def _wait_until_all_neo4j_resources_gone() -> None:
+    _wait_until_gone(_get_deployment, get_deployment_name())
+    _wait_until_gone(_get_service, get_neo4j_service_name())
+
+
+def _ensure_clean_slate() -> None:
+    deployment = _get_deployment()
+    service = _get_service()
+
+    if deployment is None and service is None:
+        return
+
+    if is_neo4j_server_up():
+        print("Existing Neo4j deployment is healthy. Reusing it.")
+        return
+
+    print(
+        "Cleaning up stale Neo4j resources before redeploying "
+        f"(deployment={'yes' if deployment else 'no'}, "
+        f"service={'yes' if service else 'no'})..."
+    )
+    _delete_all_neo4j_resources()
+    _wait_until_all_neo4j_resources_gone()
+
+
+def _create_with_conflict_retry(
+    create_fn,
+    getter,
+    delete_fn,
+    resource_name: str,
+) -> None:
+    for attempt in range(36):
+        try:
+            create_fn()
+            return
+        except ApiException as exc:
+            if exc.status != 409:
+                raise RuntimeError(
+                    f"Failed to create {resource_name}: {_format_k8s_error(exc)}"
+                ) from exc
+
+            existing = getter()
+            if existing is not None and not existing.metadata.deletion_timestamp:
+                print(f"{resource_name} already exists. Deleting before recreate...")
+                delete_fn()
+
+            print(
+                f"{resource_name} create conflict (attempt {attempt + 1}/36). "
+                "Waiting for deletion to finish..."
+            )
+            _wait_until_gone(getter, resource_name, timeout_seconds=60)
+            time.sleep(2)
+    raise RuntimeError(
+        f"Failed to create {resource_name} after repeated 409 conflicts"
+    )
+
+
 def get_deployment_diagnostics() -> dict:
     namespace = get_current_namespace()
     diagnostics = {
@@ -293,7 +440,6 @@ def get_deployment_diagnostics() -> dict:
         "deployment_status": None,
         "service_status": None,
         "neo4j_pod_status": None,
-        "recent_events": [],
     }
 
     try:
@@ -316,23 +462,36 @@ def get_deployment_diagnostics() -> dict:
         )
         available = deployment.status.available_replicas or 0
         desired = deployment.spec.replicas or 0
+        deleting = bool(deployment.metadata.deletion_timestamp)
         diagnostics["deployment_status"] = (
             f"{available}/{desired} ready "
-            f"(conditions={deployment.status.conditions})"
+            f"(deleting={deleting}, conditions={deployment.status.conditions})"
         )
+    except ApiException as exc:
+        if exc.status == 404:
+            diagnostics["deployment_status"] = "not found"
+        else:
+            diagnostics["deployment_status"] = f"error: {_format_k8s_error(exc)}"
     except Exception as exc:
-        diagnostics["deployment_status"] = f"not found: {_format_k8s_error(exc)}"
+        diagnostics["deployment_status"] = f"error: {_format_k8s_error(exc)}"
 
     try:
         service = core_api.read_namespaced_service(
             name=get_neo4j_service_name(),
             namespace=namespace,
         )
+        deleting = bool(service.metadata.deletion_timestamp)
         diagnostics["service_status"] = (
-            f"type={service.spec.type}, cluster_ip={service.spec.cluster_ip}"
+            f"type={service.spec.type}, cluster_ip={service.spec.cluster_ip}, "
+            f"deleting={deleting}"
         )
+    except ApiException as exc:
+        if exc.status == 404:
+            diagnostics["service_status"] = "not found"
+        else:
+            diagnostics["service_status"] = f"error: {_format_k8s_error(exc)}"
     except Exception as exc:
-        diagnostics["service_status"] = f"not found: {_format_k8s_error(exc)}"
+        diagnostics["service_status"] = f"error: {_format_k8s_error(exc)}"
 
     try:
         pods = core_api.list_namespaced_pod(
@@ -360,80 +519,60 @@ def get_deployment_diagnostics() -> dict:
     except Exception as exc:
         diagnostics["neo4j_pod_status"] = f"error: {_format_k8s_error(exc)}"
 
-    try:
-        events = core_api.list_namespaced_event(
-            namespace=namespace,
-            field_selector=f"involvedObject.name={get_deployment_name()}",
-        )
-        diagnostics["recent_events"] = [
-            f"{event.last_timestamp or event.event_time}: {event.reason} - {event.message}"
-            for event in sorted(
-                events.items,
-                key=lambda item: item.last_timestamp or item.event_time,
-                reverse=True,
-            )[:5]
-        ]
-    except Exception as exc:
-        diagnostics["recent_events"] = [f"error: {_format_k8s_error(exc)}"]
-
     return diagnostics
 
 
 def deploy_neo4j_server() -> None:
+    if is_neo4j_server_up():
+        print("Neo4j is already reachable. Skipping deploy.")
+        return
+
+    _ensure_clean_slate()
+
     api_instance = client.AppsV1Api()
     service_api_instance = client.CoreV1Api()
     namespace = get_current_namespace()
 
-    try:
-        api_instance.create_namespaced_deployment(
-            namespace=namespace,
-            body=create_deployment_spec_for_neo4j(),
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to create Deployment '{get_deployment_name()}': "
-            f"{_format_k8s_error(exc)}"
-        ) from exc
-
-    try:
-        service_api_instance.create_namespaced_service(
-            namespace=namespace,
-            body=create_service_spec_for_neo4j(),
-        )
-    except Exception as exc:
-        try:
-            api_instance.delete_namespaced_deployment(
+    if _get_deployment() is None:
+        _create_with_conflict_retry(
+            lambda: api_instance.create_namespaced_deployment(
+                namespace=namespace,
+                body=create_deployment_spec_for_neo4j(),
+            ),
+            _get_deployment,
+            lambda: api_instance.delete_namespaced_deployment(
                 name=get_deployment_name(),
                 namespace=namespace,
-            )
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Failed to create Service '{get_neo4j_service_name()}': "
-            f"{_format_k8s_error(exc)}"
-        ) from exc
+                body=client.V1DeleteOptions(propagation_policy="Foreground"),
+            ),
+            get_deployment_name(),
+        )
+
+    if _get_service() is None:
+        _create_with_conflict_retry(
+            lambda: service_api_instance.create_namespaced_service(
+                namespace=namespace,
+                body=create_service_spec_for_neo4j(),
+            ),
+            _get_service,
+            lambda: service_api_instance.delete_namespaced_service(
+                name=get_neo4j_service_name(),
+                namespace=namespace,
+            ),
+            get_neo4j_service_name(),
+        )
 
 
 def stop_neo4j_server() -> None:
-    api_instance = client.AppsV1Api()
-    service_api_instance = client.CoreV1Api()
-    namespace = get_current_namespace()
-
-    api_instance.delete_namespaced_deployment(
-        name=get_deployment_name(),
-        namespace=namespace,
-    )
-    service_api_instance.delete_namespaced_service(
-        name=get_neo4j_service_name(),
-        namespace=namespace,
-    )
+    _delete_all_neo4j_resources()
+    _wait_until_all_neo4j_resources_gone()
 
 
 def reset_neo4j_server() -> None:
     try:
         stop_neo4j_server()
-    except Exception as e:
-        print(f"Failed to stop Neo4j server: {e}")
+    except Exception as exc:
+        print(f"Failed to stop Neo4j server: {exc}")
     deploy_neo4j_server()
 
 
@@ -526,6 +665,56 @@ def configure_external_advertised_addresses() -> None:
     if not http_address and not bolt_address:
         return
 
+    _patch_neo4j_advertised_addresses(
+        http_address=http_address,
+        bolt_address=bolt_address,
+    )
+    print(
+        "Configured Neo4j advertised addresses for external access: "
+        f"http={http_address}, bolt={bolt_address}"
+    )
+
+
+def _cml_proxy_http_advertised_address() -> str | None:
+    base_url = get_cml_application_base_url()
+    if not base_url:
+        return None
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    if not parsed.hostname:
+        return None
+    if parsed.port:
+        return f"{parsed.hostname}:{parsed.port}"
+    if parsed.scheme == "https":
+        return f"{parsed.hostname}:443"
+    return parsed.hostname
+
+
+def configure_connectivity_addresses() -> None:
+    proxy_http_address = _cml_proxy_http_advertised_address()
+    if proxy_http_address:
+        _patch_neo4j_advertised_addresses(
+            http_address=proxy_http_address,
+            bolt_address=None,
+        )
+        print(
+            "Configured Neo4j HTTP advertised address for CML application proxy: "
+            f"http={proxy_http_address}"
+        )
+        return
+
+    configure_external_advertised_addresses()
+
+
+def _patch_neo4j_advertised_addresses(
+    http_address: str | None,
+    bolt_address: str | None,
+) -> None:
+    if not http_address and not bolt_address:
+        return
+
     api_instance = client.AppsV1Api()
     deployment = api_instance.read_namespaced_deployment(
         name=get_deployment_name(),
@@ -539,21 +728,26 @@ def configure_external_advertised_addresses() -> None:
             name="NEO4J_server_http_advertised__address",
             value=http_address,
         )
+        env_by_name["NEO4J_server_http_x__forward__enabled"] = client.V1EnvVar(
+            name="NEO4J_server_http_x__forward__enabled",
+            value="true",
+        )
+    else:
+        env_by_name.pop("NEO4J_server_http_advertised__address", None)
+
     if bolt_address:
         env_by_name["NEO4J_server_bolt_advertised__address"] = client.V1EnvVar(
             name="NEO4J_server_bolt_advertised__address",
             value=bolt_address,
         )
+    else:
+        env_by_name.pop("NEO4J_server_bolt_advertised__address", None)
 
     container.env = list(env_by_name.values())
     api_instance.patch_namespaced_deployment(
         name=get_deployment_name(),
         namespace=get_current_namespace(),
         body=deployment,
-    )
-    print(
-        "Configured Neo4j advertised addresses for external access: "
-        f"http={http_address}, bolt={bolt_address}"
     )
 
 
@@ -642,10 +836,6 @@ def get_connection_info() -> dict:
                 "Waiting for Neo4j Kubernetes service to be created. "
                 f"Details: {exc}"
             )
-        if diagnostics.get("recent_events"):
-            info["message"] += " Recent events: " + "; ".join(
-                diagnostics["recent_events"]
-            )
         return info
 
     info.update(
@@ -667,10 +857,6 @@ def get_connection_info() -> dict:
             info["message"] = (
                 "Neo4j service exists but the database is still starting. "
                 "This page refreshes every 10 seconds."
-            )
-        if diagnostics.get("recent_events"):
-            info["message"] += " Recent events: " + "; ".join(
-                diagnostics["recent_events"]
             )
         return info
 
@@ -718,26 +904,16 @@ def _bootstrap_neo4j() -> None:
         print("Neo4j server is already running.")
         return
 
-    try:
-        deploy_neo4j_server()
-    except Exception as exc:
-        print(f"Initial deployment failed ({exc}). Resetting Neo4j server...")
-        try:
-            reset_neo4j_server()
-        except Exception as reset_exc:
-            raise RuntimeError(
-                f"Failed to deploy Neo4j: {exc}. Reset also failed: {reset_exc}"
-            ) from reset_exc
+    deploy_neo4j_server()
 
     _set_supervisor_state("waiting_for_neo4j")
     wait_for_neo4j_server()
     endpoints = wait_for_external_endpoint()
-    if endpoints.get("external_browser") or endpoints.get("external_bolt"):
-        try:
-            configure_external_advertised_addresses()
-            wait_for_neo4j_server()
-        except Exception as exc:
-            print(f"Failed to configure external advertised addresses: {exc}")
+    try:
+        configure_connectivity_addresses()
+        wait_for_neo4j_server()
+    except Exception as exc:
+        print(f"Failed to configure Neo4j connectivity addresses: {exc}")
     print_connection_info()
 
 

@@ -73,9 +73,9 @@ flowchart TB
 1. **Install Dependencies** — `kubernetes`, `neo4j` パッケージをインストール
 2. **Neo4j Launcher** — Neo4j を起動し、接続情報をログとステータスページに出力
 
-アプリケーションは CML のヘルスチェック要件を満たすため、`CDSW_APP_PORT` でステータスページを公開します。Status が **Running** になると、アプリケーション名から接続情報ページを開けます。
+アプリケーションは CML のヘルスチェック要件を満たすため、`CDSW_APP_PORT` で `/health` を公開します。接続情報は `/launcher` に表示されます。Status が **running** になると、Neo4j Browser から接続できます。
 
-**Neo4j Browser** はステータスページの **Open Neo4j Browser**（`/browser/`）から開いてください。External Browser の LoadBalancer URL は、企業ネットワークや AWS セキュリティグループの制限でブラウザから到達できない場合があります。
+**Neo4j Browser** はステータスページの **Open Neo4j Browser**（`/browser/`）から開いてください。接続画面ではプロトコルに `https://` を選び、**HTTP API Connect URL**（例: `https://neo4j-launcher-<engine-id>.<domain>/`）をそのまま入力してください。
 
 ## 接続方法
 
