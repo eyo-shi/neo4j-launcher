@@ -10,12 +10,14 @@ date: "2024-07-18"
 
 environment_variables:
   NEO4J_USERNAME:
+    default: "neo4j"
     description: "Neo4j username"
     required: false
   NEO4J_PASSWORD:
     description: "Neo4j password"
     required: false
   NEO4J_SERVICE_TYPE:
+    default: "LoadBalancer"
     description: "Kubernetes Service type (LoadBalancer, NodePort, or ClusterIP)"
     required: false
   NEO4J_NODE_PORT_BOLT:
