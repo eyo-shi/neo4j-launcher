@@ -1,0 +1,48 @@
+name: Neo4j Launcher
+description: |
+  Launch Neo4j on Kubernetes and expose it externally.
+  This project only starts and monitors a Neo4j instance with APOC and Graph Data Science plugins.
+
+author: Cloudera Inc.
+specification_version: 1.0
+prototype_version: 1.0
+date: "2024-07-18"
+
+environment_variables:
+  NEO4J_USERNAME:
+    description: "Neo4j username"
+    required: false
+  NEO4J_PASSWORD:
+    description: "Neo4j password"
+    required: false
+  NEO4J_SERVICE_TYPE:
+    description: "Kubernetes Service type (LoadBalancer, NodePort, or ClusterIP)"
+    required: false
+  NEO4J_NODE_PORT_BOLT:
+    description: "NodePort for Bolt protocol (used when NEO4J_SERVICE_TYPE=NodePort)"
+    required: false
+  NEO4J_NODE_PORT_HTTP:
+    description: "NodePort for HTTP/Browser (used when NEO4J_SERVICE_TYPE=NodePort)"
+    required: false
+
+runtimes:
+  - editor: PBJ Workbench
+    kernel: Python 3.10
+    edition: Standard
+
+tasks:
+  - type: run_session
+    name: Install Dependencies
+    script: 0_session-install-dependencies/install-dependencies.py
+    short_summary: Install Dependencies
+    kernel: python3
+    cpu: 1
+    memory: 4
+  - type: start_application
+    name: Neo4j Launcher
+    script: 1_start-neo4j/start_neo4j.py
+    short_summary: Launch Neo4j and expose it externally.
+    subdomain: neo4j-launcher
+    kernel: python3
+    cpu: 1
+    memory: 4
