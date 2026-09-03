@@ -3,8 +3,8 @@ import os
 import threading
 import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urljoin
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urljoin, urlparse
 
 from utils.neo4j_utils import (
     get_connection_info,
@@ -103,10 +103,22 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         self._handle_request("OPTIONS")
 
     def _handle_request(self, method: str) -> None:
-        if self.path == "/" or self.path.startswith("/?"):
+        path = urlparse(self.path).path
+        if path in ("/health", "/healthz"):
+            self._serve_health_check()
+            return
+        if path == "/":
             self._serve_status_page()
             return
         self._proxy_request(method)
+
+    def _serve_health_check(self) -> None:
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_status_page(self) -> None:
         page = _render_status_page(get_connection_info())
@@ -129,8 +141,13 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
 
         request = urllib.request.Request(target_url, data=body, method=method)
         for header, value in self.headers.items():
-            if header.lower() not in HOP_BY_HOP_HEADERS and header.lower() != "host":
-                request.add_header(header, value)
+            header_lower = header.lower()
+            if header_lower in HOP_BY_HOP_HEADERS or header_lower == "host":
+                continue
+            request.add_header(header, value)
+
+        parsed_target = urlparse(target_url)
+        request.add_header("Host", parsed_target.netloc)
 
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -162,4 +179,6 @@ if __name__ == "__main__":
     port = int(os.getenv("CDSW_APP_PORT") or "8090")
     threading.Thread(target=run_neo4j_supervisor, daemon=True).start()
     print(f"Starting Neo4j Launcher status page on 127.0.0.1:{port}")
-    HTTPServer(("127.0.0.1", port), Neo4jLauncherHandler).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", port), Neo4jLauncherHandler)
+    server.daemon_threads = True
+    server.serve_forever()

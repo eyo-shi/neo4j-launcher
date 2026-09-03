@@ -388,9 +388,16 @@ def build_proxied_browser_path(_external_bolt: str | None = None) -> str:
     return f"/browser/?connectURL={quote(connect_url, safe='')}"
 
 
+_internal_browser_url_cache: str | None = None
+
+
 def get_internal_browser_url() -> str | None:
+    global _internal_browser_url_cache
+    if _internal_browser_url_cache:
+        return _internal_browser_url_cache
     try:
-        return get_external_endpoints()["internal_browser"]
+        _internal_browser_url_cache = get_external_endpoints()["internal_browser"]
+        return _internal_browser_url_cache
     except Exception:
         return None
 
@@ -419,7 +426,7 @@ def get_connection_info() -> dict:
 
     info.update(
         {
-            "status": "running" if is_neo4j_server_up() else "starting",
+            "status": "running",
             "internal_bolt": endpoints["internal_bolt"],
             "internal_browser": endpoints["internal_browser"],
             "external_bolt": endpoints["external_bolt"],
