@@ -6,10 +6,10 @@ from neo4j import GraphDatabase
 
 config.load_incluster_config()
 
-NEO4J_IMAGE = os.getenv("NEO4J_IMAGE", "neo4j:2026.07.1")
-NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE", "LoadBalancer")
-NEO4J_NODE_PORT_BOLT = int(os.getenv("NEO4J_NODE_PORT_BOLT", "30687"))
-NEO4J_NODE_PORT_HTTP = int(os.getenv("NEO4J_NODE_PORT_HTTP", "30474"))
+NEO4J_IMAGE = os.getenv("NEO4J_IMAGE") or "neo4j:2026.07.1"
+NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE") or "LoadBalancer"
+NEO4J_NODE_PORT_BOLT = int(os.getenv("NEO4J_NODE_PORT_BOLT") or "30687")
+NEO4J_NODE_PORT_HTTP = int(os.getenv("NEO4J_NODE_PORT_HTTP") or "30474")
 
 
 def get_current_namespace() -> str:
@@ -40,12 +40,12 @@ def get_pvc_name_from_parent_pod() -> str:
 
 
 def get_engine_id() -> str:
-    return os.getenv("CDSW_ENGINE_ID", "local").strip()
+    return (os.getenv("CDSW_ENGINE_ID") or "local").strip()
 
 
 def get_neo4j_credentials() -> dict:
-    username = os.getenv("NEO4J_USERNAME", "neo4j")
-    password = os.getenv("NEO4J_PASSWORD", "password")
+    username = os.getenv("NEO4J_USERNAME") or "neo4j"
+    password = os.getenv("NEO4J_PASSWORD") or "password"
     return {
         "username": username,
         "password": password,
