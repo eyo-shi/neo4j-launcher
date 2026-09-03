@@ -78,7 +78,7 @@ def _render_status_page(info: dict) -> str:
 <body>
   <h1>Neo4j Launcher</h1>
   <p>Neo4j deployment status and connection details.</p>
-  <p>Use <strong>Open Neo4j Browser</strong> below. On the connect screen, choose <code>https://</code> and enter the <strong>HTTP API Connect URL</strong> shown below. Do not use the external LoadBalancer Bolt URL from your browser.</p>
+  <p>Wait until <strong>Status</strong> becomes <code>running</code> before opening Neo4j Browser. On the connect screen, choose <code>https://</code> and enter the <strong>HTTP API Connect URL</strong> shown below.</p>
   <table>
     {''.join(table_rows)}
   </table>
@@ -132,7 +132,10 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
     def _proxy_request(self, method: str) -> None:
         internal_browser = get_internal_browser_url()
         if not internal_browser:
-            self.send_error(503, "Neo4j Browser is not ready yet")
+            self.send_error(
+                503,
+                "Neo4j Browser is not ready yet. Wait until Status is running.",
+            )
             return
 
         target_url = urljoin(f"{internal_browser.rstrip('/')}/", self.path.lstrip("/"))
@@ -168,6 +171,11 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                     self.send_header(header, value)
             self.end_headers()
             self.wfile.write(exc.read())
+        except urllib.error.URLError as exc:
+            self.send_error(
+                503,
+                "Neo4j Browser is not ready yet. Please wait and retry.",
+            )
         except Exception as exc:
             self.send_error(502, f"Failed to proxy Neo4j Browser request: {exc}")
 

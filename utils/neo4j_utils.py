@@ -1,10 +1,17 @@
 import os
+import socket
 import time
 
 from kubernetes import client, config
 from neo4j import GraphDatabase
 
 config.load_incluster_config()
+
+_supervisor_state: dict = {
+    "phase": "initializing",
+    "error": None,
+    "updated_at": None,
+}
 
 NEO4J_IMAGE = os.getenv("NEO4J_IMAGE") or "neo4j:2026.07.1"
 NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE") or "LoadBalancer"
@@ -17,14 +24,39 @@ def get_current_namespace() -> str:
         return f.read().strip()
 
 
+def _read_downward_api_file(path: str) -> str | None:
+    try:
+        with open(path, "r") as f:
+            value = f.read().strip()
+            return value or None
+    except OSError:
+        return None
+
+
 def get_parent_pod_name() -> str:
-    with open("/downward-api/pod.name", "r") as f:
-        return f.read().strip()
+    pod_name = _read_downward_api_file("/downward-api/pod.name")
+    if pod_name:
+        return pod_name
+    hostname = (os.getenv("HOSTNAME") or "").strip()
+    if hostname:
+        return hostname
+    raise RuntimeError(
+        "Cannot determine parent pod name. "
+        "Expected /downward-api/pod.name or HOSTNAME to be set."
+    )
 
 
 def get_parent_pod_uid() -> str:
-    with open("/downward-api/pod.uid", "r") as f:
-        return f.read().strip()
+    pod_uid = _read_downward_api_file("/downward-api/pod.uid")
+    if pod_uid:
+        return pod_uid
+    pod = client.CoreV1Api().read_namespaced_pod(
+        name=get_parent_pod_name(),
+        namespace=get_current_namespace(),
+    )
+    if pod.metadata.uid:
+        return pod.metadata.uid
+    raise RuntimeError("Cannot determine parent pod UID.")
 
 
 def get_pvc_name_from_parent_pod() -> str:
@@ -210,18 +242,50 @@ def create_service_spec_for_neo4j() -> client.V1Service:
     )
 
 
+def _set_supervisor_state(phase: str, error: str | None = None) -> None:
+    _supervisor_state["phase"] = phase
+    _supervisor_state["error"] = error
+    _supervisor_state["updated_at"] = time.time()
+
+
+def get_supervisor_state() -> dict:
+    return dict(_supervisor_state)
+
+
+def service_exists() -> bool:
+    try:
+        client.CoreV1Api().read_namespaced_service(
+            name=get_neo4j_service_name(),
+            namespace=get_current_namespace(),
+        )
+        return True
+    except Exception:
+        return False
+
+
 def deploy_neo4j_server() -> None:
     api_instance = client.AppsV1Api()
     service_api_instance = client.CoreV1Api()
+    namespace = get_current_namespace()
 
     api_instance.create_namespaced_deployment(
-        namespace=get_current_namespace(),
+        namespace=namespace,
         body=create_deployment_spec_for_neo4j(),
     )
-    service_api_instance.create_namespaced_service(
-        namespace=get_current_namespace(),
-        body=create_service_spec_for_neo4j(),
-    )
+    try:
+        service_api_instance.create_namespaced_service(
+            namespace=namespace,
+            body=create_service_spec_for_neo4j(),
+        )
+    except Exception:
+        try:
+            api_instance.delete_namespaced_deployment(
+                name=get_deployment_name(),
+                namespace=namespace,
+            )
+        except Exception:
+            pass
+        raise
 
 
 def stop_neo4j_server() -> None:
@@ -388,22 +452,38 @@ def build_proxied_browser_path(_external_bolt: str | None = None) -> str:
     return f"/browser/?connectURL={quote(connect_url, safe='')}"
 
 
-_internal_browser_url_cache: str | None = None
+def _internal_browser_url_candidates() -> list[str]:
+    service_name = get_neo4j_service_name()
+    namespace = get_current_namespace()
+    return [
+        f"http://{service_name}:7474",
+        f"http://{service_name}.{namespace}:7474",
+        f"http://{service_name}.{namespace}.svc.cluster.local:7474",
+    ]
+
+
+def _can_resolve_host(host: str) -> bool:
+    try:
+        socket.getaddrinfo(host, 7474, type=socket.SOCK_STREAM)
+        return True
+    except OSError:
+        return False
 
 
 def get_internal_browser_url() -> str | None:
-    global _internal_browser_url_cache
-    if _internal_browser_url_cache:
-        return _internal_browser_url_cache
-    try:
-        _internal_browser_url_cache = get_external_endpoints()["internal_browser"]
-        return _internal_browser_url_cache
-    except Exception:
+    if not service_exists() or not is_neo4j_server_up():
         return None
+
+    for candidate in _internal_browser_url_candidates():
+        host = candidate.split("://", 1)[1].split(":", 1)[0]
+        if _can_resolve_host(host):
+            return candidate
+    return _internal_browser_url_candidates()[0]
 
 
 def get_connection_info() -> dict:
     credentials = get_neo4j_credentials()
+    supervisor = get_supervisor_state()
     info = {
         "status": "starting",
         "username": credentials["username"],
@@ -414,19 +494,26 @@ def get_connection_info() -> dict:
         "external_browser": None,
         "service_type": None,
         "port_forward_command": None,
-        "proxied_browser_path": "/browser/",
+        "proxied_browser_path": None,
         "http_api_connect_url": None,
+        "supervisor_phase": supervisor.get("phase"),
     }
+
+    if supervisor.get("error"):
+        info["message"] = f"Deployment error: {supervisor['error']}"
 
     try:
         endpoints = get_external_endpoints()
     except Exception as exc:
-        info["message"] = f"Waiting for Neo4j service: {exc}"
+        if not info.get("message"):
+            info["message"] = (
+                "Waiting for Neo4j Kubernetes service to be created. "
+                f"Details: {exc}"
+            )
         return info
 
     info.update(
         {
-            "status": "running",
             "internal_bolt": endpoints["internal_bolt"],
             "internal_browser": endpoints["internal_browser"],
             "external_bolt": endpoints["external_bolt"],
@@ -438,6 +525,17 @@ def get_connection_info() -> dict:
         info["port_forward_command"] = (
             f"kubectl port-forward svc/{get_neo4j_service_name()} 7474:7474 7687:7687"
         )
+
+    if not is_neo4j_server_up():
+        if not info.get("message"):
+            info["message"] = (
+                "Neo4j service exists but the database is still starting. "
+                "This page refreshes every 10 seconds."
+            )
+        return info
+
+    info["status"] = "running"
+    info["message"] = None
     info["proxied_browser_path"] = build_proxied_browser_path()
     info["http_api_connect_url"] = get_cml_application_base_url()
     if info["http_api_connect_url"]:
@@ -466,18 +564,24 @@ def print_connection_info() -> None:
     print("=============================\n")
 
 
-def run_neo4j_supervisor() -> None:
-    print("Starting Neo4j server...")
-
+def _bootstrap_neo4j() -> None:
+    _set_supervisor_state("deploying")
     if is_neo4j_server_up():
         print("Neo4j server is already running.")
-    else:
-        try:
-            deploy_neo4j_server()
-        except Exception:
-            print("Deployment may already exist. Resetting Neo4j server...")
-            reset_neo4j_server()
+        return
 
+    try:
+        deploy_neo4j_server()
+    except Exception as exc:
+        print(f"Initial deployment failed ({exc}). Resetting Neo4j server...")
+        try:
+            reset_neo4j_server()
+        except Exception as reset_exc:
+            raise RuntimeError(
+                f"Failed to deploy Neo4j: {exc}. Reset also failed: {reset_exc}"
+            ) from reset_exc
+
+    _set_supervisor_state("waiting_for_neo4j")
     wait_for_neo4j_server()
     endpoints = wait_for_external_endpoint()
     if endpoints.get("external_browser") or endpoints.get("external_bolt"):
@@ -488,11 +592,25 @@ def run_neo4j_supervisor() -> None:
             print(f"Failed to configure external advertised addresses: {exc}")
     print_connection_info()
 
-    print("Neo4j is running. Monitoring in background.")
+
+def run_neo4j_supervisor() -> None:
+    print("Starting Neo4j server...")
     while True:
-        if not is_neo4j_server_up():
-            print("Neo4j server is down. Attempting to restart...")
-            reset_neo4j_server()
-            wait_for_neo4j_server()
-            print_connection_info()
-        time.sleep(30)
+        try:
+            _set_supervisor_state("initializing")
+            _bootstrap_neo4j()
+            _set_supervisor_state("running")
+            print("Neo4j is running. Monitoring in background.")
+            while True:
+                if not is_neo4j_server_up():
+                    print("Neo4j server is down. Attempting to restart...")
+                    _set_supervisor_state("restarting")
+                    reset_neo4j_server()
+                    wait_for_neo4j_server()
+                    print_connection_info()
+                    _set_supervisor_state("running")
+                time.sleep(30)
+        except Exception as exc:
+            print(f"Neo4j supervisor error: {exc}")
+            _set_supervisor_state("error", str(exc))
+            time.sleep(30)
