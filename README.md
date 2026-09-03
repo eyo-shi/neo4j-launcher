@@ -71,7 +71,9 @@ flowchart TB
 ### AMP タスク
 
 1. **Install Dependencies** — `kubernetes`, `neo4j` パッケージをインストール
-2. **Neo4j Launcher** — Neo4j を起動し、接続情報をログに出力
+2. **Neo4j Launcher** — Neo4j を起動し、接続情報をログとステータスページに出力
+
+アプリケーションは CML のヘルスチェック要件を満たすため、`CDSW_APP_PORT` でステータスページを公開します。Status が **Running** になると、アプリケーション名から接続情報ページを開けます。
 
 ## 接続方法
 

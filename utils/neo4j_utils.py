@@ -304,20 +304,82 @@ def wait_for_external_endpoint(max_retries: int = 30, sleep_duration: int = 10) 
     return get_external_endpoints()
 
 
-def print_connection_info() -> None:
+def get_connection_info() -> dict:
     credentials = get_neo4j_credentials()
-    endpoints = get_external_endpoints()
+    info = {
+        "status": "starting",
+        "username": credentials["username"],
+        "password": credentials["password"],
+        "internal_bolt": None,
+        "internal_browser": None,
+        "external_bolt": None,
+        "external_browser": None,
+        "service_type": None,
+        "port_forward_command": None,
+    }
+
+    try:
+        endpoints = get_external_endpoints()
+    except Exception as exc:
+        info["message"] = f"Waiting for Neo4j service: {exc}"
+        return info
+
+    info.update(
+        {
+            "status": "running" if is_neo4j_server_up() else "starting",
+            "internal_bolt": endpoints["internal_bolt"],
+            "internal_browser": endpoints["internal_browser"],
+            "external_bolt": endpoints["external_bolt"],
+            "external_browser": endpoints["external_browser"],
+            "service_type": endpoints["service_type"],
+        }
+    )
+    if endpoints["service_type"] == "ClusterIP":
+        info["port_forward_command"] = (
+            f"kubectl port-forward svc/{get_neo4j_service_name()} 7474:7474 7687:7687"
+        )
+    return info
+
+
+def print_connection_info() -> None:
+    info = get_connection_info()
 
     print("\n=== Neo4j Connection Info ===")
-    print(f"Username: {credentials['username']}")
-    print(f"Password: {credentials['password']}")
-    print(f"Internal Bolt URI: {endpoints['internal_bolt']}")
-    print(f"Internal Browser:  {endpoints['internal_browser']}")
-    if endpoints["external_bolt"]:
-        print(f"External Bolt URI: {endpoints['external_bolt']}")
-    if endpoints["external_browser"]:
-        print(f"External Browser:  {endpoints['external_browser']}")
-    if endpoints["service_type"] == "ClusterIP":
+    print(f"Username: {info['username']}")
+    print(f"Password: {info['password']}")
+    print(f"Internal Bolt URI: {info['internal_bolt']}")
+    print(f"Internal Browser:  {info['internal_browser']}")
+    if info["external_bolt"]:
+        print(f"External Bolt URI: {info['external_bolt']}")
+    if info["external_browser"]:
+        print(f"External Browser:  {info['external_browser']}")
+    if info["port_forward_command"]:
         print("Service type is ClusterIP. Use port-forward for external access:")
-        print(f"  kubectl port-forward svc/{get_neo4j_service_name()} 7474:7474 7687:7687")
+        print(f"  {info['port_forward_command']}")
     print("=============================\n")
+
+
+def run_neo4j_supervisor() -> None:
+    print("Starting Neo4j server...")
+
+    if is_neo4j_server_up():
+        print("Neo4j server is already running.")
+    else:
+        try:
+            deploy_neo4j_server()
+        except Exception:
+            print("Deployment may already exist. Resetting Neo4j server...")
+            reset_neo4j_server()
+
+    wait_for_neo4j_server()
+    wait_for_external_endpoint()
+    print_connection_info()
+
+    print("Neo4j is running. Monitoring in background.")
+    while True:
+        if not is_neo4j_server_up():
+            print("Neo4j server is down. Attempting to restart...")
+            reset_neo4j_server()
+            wait_for_neo4j_server()
+            print_connection_info()
+        time.sleep(30)
