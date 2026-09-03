@@ -28,6 +28,12 @@ def _render_status_page(info: dict) -> str:
     status = html.escape(info.get("status", "starting"))
     rows = [
         ("Status", status),
+        ("Supervisor Phase", info.get("supervisor_phase")),
+        ("Deployment", info.get("deployment_status")),
+        ("Service", info.get("service_status")),
+        ("Neo4j Pod", info.get("neo4j_pod_status")),
+        ("Parent Pod", info.get("parent_pod")),
+        ("PVC Claim", info.get("pvc_claim")),
         ("Username", info.get("username")),
         ("Password", info.get("password")),
         ("Neo4j Browser", info.get("proxied_browser_path")),
@@ -78,7 +84,7 @@ def _render_status_page(info: dict) -> str:
 <body>
   <h1>Neo4j Launcher</h1>
   <p>Neo4j deployment status and connection details.</p>
-  <p>Wait until <strong>Status</strong> becomes <code>running</code> before opening Neo4j Browser. On the connect screen, choose <code>https://</code> and enter the <strong>HTTP API Connect URL</strong> shown below.</p>
+  <p>Wait until <strong>Status</strong> becomes <code>running</code> before opening Neo4j Browser. If it stays <code>starting</code> for more than a few minutes, check <strong>Deployment</strong>, <strong>Service</strong>, and <strong>Message</strong> below, and review the Application logs in CML.</p>
   <table>
     {''.join(table_rows)}
   </table>

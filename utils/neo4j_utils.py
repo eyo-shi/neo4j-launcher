@@ -17,6 +17,7 @@ NEO4J_IMAGE = os.getenv("NEO4J_IMAGE") or "neo4j:2026.07.1"
 NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE") or "LoadBalancer"
 NEO4J_NODE_PORT_BOLT = int(os.getenv("NEO4J_NODE_PORT_BOLT") or "30687")
 NEO4J_NODE_PORT_HTTP = int(os.getenv("NEO4J_NODE_PORT_HTTP") or "30474")
+NEO4J_MEMORY = os.getenv("NEO4J_MEMORY") or "2Gi"
 
 
 def get_current_namespace() -> str:
@@ -64,11 +65,21 @@ def get_pvc_name_from_parent_pod() -> str:
     pod_spec = client.CoreV1Api().read_namespaced_pod(
         name=pod_name, namespace=get_current_namespace()
     )
-    volume_mounts = pod_spec.spec.containers[0].volume_mounts
-    for volume_mount in volume_mounts:
+    volume_mount_name = None
+    for volume_mount in pod_spec.spec.containers[0].volume_mounts or []:
         if volume_mount.mount_path == "/home/cdsw":
-            return volume_mount.name
-    raise RuntimeError("PVC volume mount for /home/cdsw not found")
+            volume_mount_name = volume_mount.name
+            break
+    if not volume_mount_name:
+        raise RuntimeError("PVC volume mount for /home/cdsw not found")
+
+    for volume in pod_spec.spec.volumes or []:
+        if volume.name == volume_mount_name and volume.persistent_volume_claim:
+            return volume.persistent_volume_claim.claim_name
+
+    raise RuntimeError(
+        f"PVC claim name not found for volume mount '{volume_mount_name}'"
+    )
 
 
 def get_engine_id() -> str:
@@ -169,8 +180,8 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                                 ),
                             ],
                             resources=client.V1ResourceRequirements(
-                                requests={"cpu": "1", "memory": "4Gi"},
-                                limits={"cpu": "1", "memory": "4Gi"},
+                                requests={"cpu": "1", "memory": NEO4J_MEMORY},
+                                limits={"cpu": "1", "memory": NEO4J_MEMORY},
                             ),
                             volume_mounts=[
                                 client.V1VolumeMount(
@@ -263,21 +274,133 @@ def service_exists() -> bool:
         return False
 
 
+def _format_k8s_error(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if body:
+        return f"{exc} | body={body}"
+    return str(exc)
+
+
+def get_deployment_diagnostics() -> dict:
+    namespace = get_current_namespace()
+    diagnostics = {
+        "namespace": namespace,
+        "engine_id": get_engine_id(),
+        "deployment_name": get_deployment_name(),
+        "service_name": get_neo4j_service_name(),
+        "parent_pod": None,
+        "pvc_claim": None,
+        "deployment_status": None,
+        "service_status": None,
+        "neo4j_pod_status": None,
+        "recent_events": [],
+    }
+
+    try:
+        diagnostics["parent_pod"] = get_parent_pod_name()
+    except Exception as exc:
+        diagnostics["parent_pod"] = f"error: {exc}"
+
+    try:
+        diagnostics["pvc_claim"] = get_pvc_name_from_parent_pod()
+    except Exception as exc:
+        diagnostics["pvc_claim"] = f"error: {exc}"
+
+    apps_api = client.AppsV1Api()
+    core_api = client.CoreV1Api()
+
+    try:
+        deployment = apps_api.read_namespaced_deployment(
+            name=get_deployment_name(),
+            namespace=namespace,
+        )
+        available = deployment.status.available_replicas or 0
+        desired = deployment.spec.replicas or 0
+        diagnostics["deployment_status"] = (
+            f"{available}/{desired} ready "
+            f"(conditions={deployment.status.conditions})"
+        )
+    except Exception as exc:
+        diagnostics["deployment_status"] = f"not found: {_format_k8s_error(exc)}"
+
+    try:
+        service = core_api.read_namespaced_service(
+            name=get_neo4j_service_name(),
+            namespace=namespace,
+        )
+        diagnostics["service_status"] = (
+            f"type={service.spec.type}, cluster_ip={service.spec.cluster_ip}"
+        )
+    except Exception as exc:
+        diagnostics["service_status"] = f"not found: {_format_k8s_error(exc)}"
+
+    try:
+        pods = core_api.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"app={get_deployment_name()}",
+        )
+        if not pods.items:
+            diagnostics["neo4j_pod_status"] = "no pods found"
+        else:
+            pod_lines = []
+            for pod in pods.items:
+                state = pod.status.phase
+                reason = pod.status.reason or ""
+                message = ""
+                if pod.status.container_statuses:
+                    container = pod.status.container_statuses[0]
+                    waiting = container.state.waiting
+                    if waiting:
+                        reason = waiting.reason or reason
+                        message = waiting.message or ""
+                pod_lines.append(
+                    f"{pod.metadata.name}: phase={state}, reason={reason}, message={message}"
+                )
+            diagnostics["neo4j_pod_status"] = " | ".join(pod_lines)
+    except Exception as exc:
+        diagnostics["neo4j_pod_status"] = f"error: {_format_k8s_error(exc)}"
+
+    try:
+        events = core_api.list_namespaced_event(
+            namespace=namespace,
+            field_selector=f"involvedObject.name={get_deployment_name()}",
+        )
+        diagnostics["recent_events"] = [
+            f"{event.last_timestamp or event.event_time}: {event.reason} - {event.message}"
+            for event in sorted(
+                events.items,
+                key=lambda item: item.last_timestamp or item.event_time,
+                reverse=True,
+            )[:5]
+        ]
+    except Exception as exc:
+        diagnostics["recent_events"] = [f"error: {_format_k8s_error(exc)}"]
+
+    return diagnostics
+
+
 def deploy_neo4j_server() -> None:
     api_instance = client.AppsV1Api()
     service_api_instance = client.CoreV1Api()
     namespace = get_current_namespace()
 
-    api_instance.create_namespaced_deployment(
-        namespace=namespace,
-        body=create_deployment_spec_for_neo4j(),
-    )
+    try:
+        api_instance.create_namespaced_deployment(
+            namespace=namespace,
+            body=create_deployment_spec_for_neo4j(),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to create Deployment '{get_deployment_name()}': "
+            f"{_format_k8s_error(exc)}"
+        ) from exc
+
     try:
         service_api_instance.create_namespaced_service(
             namespace=namespace,
             body=create_service_spec_for_neo4j(),
         )
-    except Exception:
+    except Exception as exc:
         try:
             api_instance.delete_namespaced_deployment(
                 name=get_deployment_name(),
@@ -285,7 +408,10 @@ def deploy_neo4j_server() -> None:
             )
         except Exception:
             pass
-        raise
+        raise RuntimeError(
+            f"Failed to create Service '{get_neo4j_service_name()}': "
+            f"{_format_k8s_error(exc)}"
+        ) from exc
 
 
 def stop_neo4j_server() -> None:
@@ -484,6 +610,7 @@ def get_internal_browser_url() -> str | None:
 def get_connection_info() -> dict:
     credentials = get_neo4j_credentials()
     supervisor = get_supervisor_state()
+    diagnostics = get_deployment_diagnostics()
     info = {
         "status": "starting",
         "username": credentials["username"],
@@ -497,6 +624,11 @@ def get_connection_info() -> dict:
         "proxied_browser_path": None,
         "http_api_connect_url": None,
         "supervisor_phase": supervisor.get("phase"),
+        "deployment_status": diagnostics.get("deployment_status"),
+        "service_status": diagnostics.get("service_status"),
+        "neo4j_pod_status": diagnostics.get("neo4j_pod_status"),
+        "pvc_claim": diagnostics.get("pvc_claim"),
+        "parent_pod": diagnostics.get("parent_pod"),
     }
 
     if supervisor.get("error"):
@@ -509,6 +641,10 @@ def get_connection_info() -> dict:
             info["message"] = (
                 "Waiting for Neo4j Kubernetes service to be created. "
                 f"Details: {exc}"
+            )
+        if diagnostics.get("recent_events"):
+            info["message"] += " Recent events: " + "; ".join(
+                diagnostics["recent_events"]
             )
         return info
 
@@ -531,6 +667,10 @@ def get_connection_info() -> dict:
             info["message"] = (
                 "Neo4j service exists but the database is still starting. "
                 "This page refreshes every 10 seconds."
+            )
+        if diagnostics.get("recent_events"):
+            info["message"] += " Recent events: " + "; ".join(
+                diagnostics["recent_events"]
             )
         return info
 
@@ -566,6 +706,14 @@ def print_connection_info() -> None:
 
 def _bootstrap_neo4j() -> None:
     _set_supervisor_state("deploying")
+    print("Running deployment preflight checks...")
+    print(f"  namespace={get_current_namespace()}")
+    print(f"  parent_pod={get_parent_pod_name()}")
+    print(f"  pvc_claim={get_pvc_name_from_parent_pod()}")
+    print(f"  deployment={get_deployment_name()}")
+    print(f"  service={get_neo4j_service_name()}")
+    print(f"  neo4j_memory={NEO4J_MEMORY}")
+
     if is_neo4j_server_up():
         print("Neo4j server is already running.")
         return
