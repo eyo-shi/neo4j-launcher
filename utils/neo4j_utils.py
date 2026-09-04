@@ -35,7 +35,6 @@ POD_FAILURE_MARKERS = (
     "ErrImagePull",
     "OOMKilled",
     "CreateContainerConfigError",
-    "InvalidImageName",
     "Init:CrashLoopBackOff",
     "Init:Error",
     "Error",
@@ -280,11 +279,21 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     logs_mount = client.V1VolumeMount(name="neo4j-logs", mount_path="/logs")
 
     pod_spec = client.V1PodSpec(
+        security_context=client.V1PodSecurityContext(
+            fs_group=NEO4J_CONTAINER_GID,
+            fs_group_change_policy="Always",
+        ),
         containers=[
             client.V1Container(
                 name="neo4j",
                 image=NEO4J_IMAGE,
                 image_pull_policy="IfNotPresent",
+                security_context=client.V1SecurityContext(
+                    allow_privilege_escalation=False,
+                    run_as_non_root=True,
+                    run_as_user=NEO4J_CONTAINER_UID,
+                    run_as_group=NEO4J_CONTAINER_GID,
+                ),
                 ports=[
                     client.V1ContainerPort(
                         container_port=7687, name="bolt"
@@ -319,11 +328,6 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
             ),
         ],
     )
-    if NEO4J_USE_PVC:
-        pod_spec.security_context = client.V1PodSecurityContext(
-            fs_group=NEO4J_CONTAINER_GID,
-            fs_group_change_policy="Always",
-        )
 
     return client.V1Deployment(
         api_version="apps/v1",
@@ -337,7 +341,12 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
             progress_deadline_seconds=600,
             selector=client.V1LabelSelector(match_labels={"app": get_deployment_name()}),
             template=client.V1PodTemplateSpec(
-                metadata=client.V1ObjectMeta(labels={"app": get_deployment_name()}),
+                metadata=client.V1ObjectMeta(
+                    labels={"app": get_deployment_name()},
+                    annotations={
+                        "sidecar.istio.io/inject": "false",
+                    },
+                ),
                 spec=pod_spec,
             ),
         ),
@@ -573,6 +582,10 @@ def _get_recent_deployment_events(limit: int = 8) -> str | None:
                 f"{event.type} {event.reason}: {event.message}"
             )
         return "\n".join(lines) if lines else None
+    except ApiException as exc:
+        if exc.status == 403:
+            return None
+        return f"error reading events: {_format_k8s_error(exc)}"
     except Exception as exc:
         return f"error reading events: {_format_k8s_error(exc)}"
 
