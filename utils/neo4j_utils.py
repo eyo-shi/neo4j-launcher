@@ -442,20 +442,20 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
 
     pod_spec = client.V1PodSpec(
         # security_context=client.V1PodSecurityContext(
-            fs_group=NEO4J_CONTAINER_GID,
-            fs_group_change_policy="Always",
-        ),
+        #    fs_group=NEO4J_CONTAINER_GID,
+        #    fs_group_change_policy="Always",
+        #),
         containers=[
             client.V1Container(
                 name="neo4j",
                 image=NEO4J_IMAGE,
                 image_pull_policy="IfNotPresent",
                 #security_context=client.V1SecurityContext(
-                    allow_privilege_escalation=False,
-                    run_as_non_root=True,
-                    run_as_user=NEO4J_CONTAINER_UID,
-                    run_as_group=NEO4J_CONTAINER_GID,
-                ),
+                #    allow_privilege_escalation=False,
+                #    run_as_non_root=True,
+                #    run_as_user=NEO4J_CONTAINER_UID,
+                #    run_as_group=NEO4J_CONTAINER_GID,
+                #),
                 ports=[
                     client.V1ContainerPort(
                         container_port=7687, name="bolt"
