@@ -20,10 +20,14 @@ NEO4J_IMAGE = os.getenv("NEO4J_IMAGE") or "neo4j:2026.07.1"
 NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE") or "LoadBalancer"
 NEO4J_NODE_PORT_BOLT = int(os.getenv("NEO4J_NODE_PORT_BOLT") or "30687")
 NEO4J_NODE_PORT_HTTP = int(os.getenv("NEO4J_NODE_PORT_HTTP") or "30474")
-NEO4J_MEMORY = os.getenv("NEO4J_MEMORY") or "4Gi"
+NEO4J_MEMORY = os.getenv("NEO4J_MEMORY") or "2Gi"
+NEO4J_PLUGINS = os.getenv("NEO4J_PLUGINS") or "[]"
+NEO4J_USE_PVC = os.getenv("NEO4J_USE_PVC", "false").lower() in ("1", "true", "yes")
 NEO4J_STARTUP_TIMEOUT_SECONDS = int(
     os.getenv("NEO4J_STARTUP_TIMEOUT_SECONDS") or "1200"
 )
+NEO4J_CONTAINER_UID = 7474
+NEO4J_CONTAINER_GID = 7474
 
 
 def get_current_namespace() -> str:
@@ -160,7 +164,7 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
         ),
         client.V1EnvVar(
             name="NEO4J_PLUGINS",
-            value='["apoc","graph-data-science"]',
+            value=NEO4J_PLUGINS,
         ),
         client.V1EnvVar(
             name="NEO4J_server_http_listen__address",
@@ -176,15 +180,15 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
         ),
         client.V1EnvVar(
             name="NEO4J_server_memory_heap_initial__size",
-            value=os.getenv("NEO4J_HEAP_INITIAL") or "1G",
+            value=os.getenv("NEO4J_HEAP_INITIAL") or "512m",
         ),
         client.V1EnvVar(
             name="NEO4J_server_memory_heap_max__size",
-            value=os.getenv("NEO4J_HEAP_MAX") or "2G",
+            value=os.getenv("NEO4J_HEAP_MAX") or "1G",
         ),
         client.V1EnvVar(
             name="NEO4J_server_memory_pagecache_size",
-            value=os.getenv("NEO4J_PAGECACHE") or "1G",
+            value=os.getenv("NEO4J_PAGECACHE") or "512m",
         ),
     ]
     proxy_http_address = _cml_proxy_http_advertised_address()
@@ -200,15 +204,27 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
 
 def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     namespace = get_current_namespace()
-    engine_id = get_engine_id()
     credentials = get_neo4j_credentials()
+
+    data_volume = client.V1Volume(name="neo4j-data")
+    if NEO4J_USE_PVC:
+        data_volume.persistent_volume_claim = (
+            client.V1PersistentVolumeClaimVolumeSource(
+                claim_name=get_pvc_name_from_parent_pod()
+            )
+        )
+    else:
+        data_volume.empty_dir = client.V1EmptyDirVolumeSource()
+
+    data_mount = client.V1VolumeMount(name="neo4j-data", mount_path="/data")
+    if NEO4J_USE_PVC:
+        data_mount.sub_path = "neo4j-volume"
 
     return client.V1Deployment(
         api_version="apps/v1",
         metadata=client.V1ObjectMeta(
             name=get_deployment_name(),
             labels={"app": get_deployment_name()},
-            owner_references=[get_owner_reference()],
             namespace=namespace,
         ),
         spec=client.V1DeploymentSpec(
@@ -218,15 +234,19 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 metadata=client.V1ObjectMeta(labels={"app": get_deployment_name()}),
                 spec=client.V1PodSpec(
                     security_context=client.V1PodSecurityContext(
-                        fs_group=8536,
-                        run_as_group=8536,
-                        run_as_user=8536,
-                        run_as_non_root=True,
+                        fs_group=NEO4J_CONTAINER_GID,
+                        fs_group_change_policy="Always",
                     ),
                     containers=[
                         client.V1Container(
                             name="neo4j",
                             image=NEO4J_IMAGE,
+                            security_context=client.V1SecurityContext(
+                                allow_privilege_escalation=False,
+                                run_as_non_root=True,
+                                run_as_user=NEO4J_CONTAINER_UID,
+                                run_as_group=NEO4J_CONTAINER_GID,
+                            ),
                             ports=[
                                 client.V1ContainerPort(
                                     container_port=7687, name="bolt"
@@ -237,41 +257,29 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                             ],
                             env=_neo4j_container_env(credentials),
                             resources=client.V1ResourceRequirements(
-                                requests={"cpu": "1", "memory": NEO4J_MEMORY},
+                                requests={"cpu": "500m", "memory": NEO4J_MEMORY},
                                 limits={"cpu": "2", "memory": NEO4J_MEMORY},
                             ),
                             readiness_probe=client.V1Probe(
-                                http_get=client.V1HTTPGetAction(
-                                    path="/",
-                                    port=7474,
-                                ),
+                                tcp_socket=client.V1TCPSocketAction(port=7687),
                                 initial_delay_seconds=30,
                                 period_seconds=10,
                                 failure_threshold=60,
                             ),
                             volume_mounts=[
+                                data_mount,
                                 client.V1VolumeMount(
-                                    name="neo4j-plugins",
-                                    mount_path="/plugins",
-                                ),
-                                client.V1VolumeMount(
-                                    name="filesystem-access",
-                                    mount_path="/data",
-                                    sub_path="neo4j-volume",
+                                    name="neo4j-logs",
+                                    mount_path="/logs",
                                 ),
                             ],
                         )
                     ],
                     volumes=[
+                        data_volume,
                         client.V1Volume(
-                            name="neo4j-plugins",
+                            name="neo4j-logs",
                             empty_dir=client.V1EmptyDirVolumeSource(),
-                        ),
-                        client.V1Volume(
-                            name="filesystem-access",
-                            persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
-                                claim_name=get_pvc_name_from_parent_pod()
-                            ),
                         ),
                     ],
                 ),
@@ -307,7 +315,6 @@ def create_service_spec_for_neo4j() -> client.V1Service:
         metadata=client.V1ObjectMeta(
             name=service_name,
             labels={"app": get_deployment_name()},
-            owner_references=[get_owner_reference()],
             namespace=namespace,
             annotations=annotations or None,
         ),
@@ -437,6 +444,53 @@ def _wait_until_all_neo4j_resources_gone() -> None:
     _wait_until_gone(_get_service, get_neo4j_service_name())
 
 
+def _get_neo4j_pod_logs(tail_lines: int = 40) -> str | None:
+    core_api = client.CoreV1Api()
+    try:
+        pods = core_api.list_namespaced_pod(
+            namespace=get_current_namespace(),
+            label_selector=f"app={get_deployment_name()}",
+        )
+        if not pods.items:
+            return None
+        return core_api.read_namespaced_pod_log(
+            name=pods.items[0].metadata.name,
+            namespace=get_current_namespace(),
+            tail_lines=tail_lines,
+            container="neo4j",
+        )
+    except Exception as exc:
+        return f"error reading logs: {_format_k8s_error(exc)}"
+
+
+def _deployment_should_be_reused(
+    deployment: client.V1Deployment | None,
+    service: client.V1Service | None,
+    pod_status: str,
+) -> bool:
+    if deployment is None or service is None:
+        return False
+    if is_neo4j_server_up() or is_neo4j_http_up():
+        return True
+
+    failure_or_stuck = (
+        "no pods found",
+        "FailedScheduling",
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "OOMKilled",
+        "Error",
+        "CreateContainerConfigError",
+        "InvalidImageName",
+    )
+    if any(marker in pod_status for marker in failure_or_stuck):
+        return False
+
+    starting_markers = ("ContainerCreating", "PodInitializing", "Running")
+    return any(marker in pod_status for marker in starting_markers)
+
+
 def _ensure_clean_slate() -> None:
     deployment = _get_deployment()
     service = _get_service()
@@ -444,29 +498,16 @@ def _ensure_clean_slate() -> None:
     if deployment is None and service is None:
         return
 
-    if is_neo4j_server_up():
-        print("Existing Neo4j deployment is healthy. Reusing it.")
-        return
-
     pod_status = get_deployment_diagnostics().get("neo4j_pod_status") or ""
-    failure_markers = (
-        "CrashLoopBackOff",
-        "ImagePullBackOff",
-        "ErrImagePull",
-        "Error",
-        "OOMKilled",
-    )
-    if deployment and service and not any(
-        marker in pod_status for marker in failure_markers
-    ):
+    if _deployment_should_be_reused(deployment, service, pod_status):
         print(
-            "Neo4j resources already exist and pods are still starting. "
-            f"Reusing deployment. Pod status: {pod_status}"
+            "Reusing existing Neo4j resources. "
+            f"Pod status: {pod_status}"
         )
         return
 
     print(
-        "Cleaning up stale Neo4j resources before redeploying "
+        "Cleaning up Neo4j resources before redeploying "
         f"(deployment={'yes' if deployment else 'no'}, "
         f"service={'yes' if service else 'no'}, "
         f"pod_status={pod_status})..."
@@ -598,6 +639,8 @@ def get_deployment_diagnostics() -> dict:
     except Exception as exc:
         diagnostics["neo4j_pod_status"] = f"error: {_format_k8s_error(exc)}"
 
+    diagnostics["neo4j_pod_logs"] = _get_neo4j_pod_logs()
+
     return diagnostics
 
 
@@ -656,15 +699,43 @@ def reset_neo4j_server() -> None:
 
 
 def is_neo4j_http_up() -> bool:
+    return _first_reachable_http_url() is not None
+
+
+def _all_http_url_candidates() -> list[str]:
+    candidates = list(_internal_browser_url_candidates())
+    core_api = client.CoreV1Api()
+    try:
+        endpoints = core_api.read_namespaced_endpoints(
+            name=get_neo4j_service_name(),
+            namespace=get_current_namespace(),
+        )
+        for subset in endpoints.subsets or []:
+            for address in subset.addresses or []:
+                if address.ip:
+                    candidates.append(f"http://{address.ip}:7474")
+    except ApiException:
+        pass
+
+    unique_candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _first_reachable_http_url() -> str | None:
     if not service_exists():
-        return False
-    for candidate in _internal_browser_url_candidates():
+        return None
+    for candidate in _all_http_url_candidates():
         try:
             urllib.request.urlopen(f"{candidate.rstrip('/')}/", timeout=5)
-            return True
+            return candidate
         except (urllib.error.URLError, TimeoutError, OSError):
             continue
-    return False
+    return None
 
 
 def is_neo4j_server_up() -> bool:
@@ -889,14 +960,26 @@ def _can_resolve_host(host: str) -> bool:
 
 
 def get_internal_browser_url() -> str | None:
-    if not is_neo4j_http_up():
-        return None
+    return _first_reachable_http_url()
 
-    for candidate in _internal_browser_url_candidates():
-        host = candidate.split("://", 1)[1].split(":", 1)[0]
-        if _can_resolve_host(host):
-            return candidate
-    return _internal_browser_url_candidates()[0]
+
+def get_proxy_unavailable_reason() -> str:
+    diagnostics = get_deployment_diagnostics()
+    supervisor = get_supervisor_state()
+    parts: list[str] = []
+    if supervisor.get("error"):
+        parts.append(f"Supervisor error: {supervisor['error']}")
+    if diagnostics.get("deployment_status"):
+        parts.append(f"Deployment: {diagnostics['deployment_status']}")
+    if diagnostics.get("service_status"):
+        parts.append(f"Service: {diagnostics['service_status']}")
+    if diagnostics.get("neo4j_pod_status"):
+        parts.append(f"Pod: {diagnostics['neo4j_pod_status']}")
+    logs = diagnostics.get("neo4j_pod_logs")
+    if logs:
+        tail = logs.strip().splitlines()[-3:]
+        parts.append("Recent logs: " + " | ".join(line.strip() for line in tail))
+    return " ".join(parts) if parts else "Neo4j HTTP endpoint is not reachable yet."
 
 
 def get_connection_info() -> dict:
@@ -919,6 +1002,7 @@ def get_connection_info() -> dict:
         "deployment_status": diagnostics.get("deployment_status"),
         "service_status": diagnostics.get("service_status"),
         "neo4j_pod_status": diagnostics.get("neo4j_pod_status"),
+        "neo4j_pod_logs": diagnostics.get("neo4j_pod_logs"),
         "pvc_claim": diagnostics.get("pvc_claim"),
         "parent_pod": diagnostics.get("parent_pod"),
     }
@@ -959,10 +1043,7 @@ def get_connection_info() -> dict:
                     "APOC/GDS plugin download can take several minutes on first start."
                 )
             else:
-                info["message"] = (
-                    "Neo4j service exists but the database is still starting. "
-                    "First startup with APOC/GDS can take 10-20 minutes."
-                )
+                info["message"] = get_proxy_unavailable_reason()
         if http_ready:
             info["proxied_browser_path"] = build_proxied_browser_path()
             info["http_api_connect_url"] = get_cml_application_base_url()

@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlparse
 from utils.neo4j_utils import (
     get_connection_info,
     get_internal_browser_url,
+    get_proxy_unavailable_reason,
     run_neo4j_supervisor,
 )
 
@@ -40,6 +41,7 @@ def _render_status_page(info: dict) -> str:
         ("Deployment", info.get("deployment_status")),
         ("Service", info.get("service_status")),
         ("Neo4j Pod", info.get("neo4j_pod_status")),
+        ("Pod Logs (tail)", info.get("neo4j_pod_logs")),
         ("Parent Pod", info.get("parent_pod")),
         ("PVC Claim", info.get("pvc_claim")),
         ("Username", info.get("username")),
@@ -63,6 +65,11 @@ def _render_status_page(info: dict) -> str:
             cell = (
                 f'<a href="{html.escape(value)}">Open Neo4j Browser</a> '
                 "(recommended)"
+            )
+        elif label == "Pod Logs (tail)" and value:
+            cell = (
+                f"<pre style='max-height:12rem;overflow:auto'>"
+                f"{html.escape(str(value)[-2000:])}</pre>"
             )
         elif label == "External Browser" and str(value).startswith("http"):
             cell = (
@@ -146,9 +153,10 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
     def _proxy_request(self, method: str) -> None:
         internal_browser = get_internal_browser_url()
         if not internal_browser:
+            reason = get_proxy_unavailable_reason()
             self.send_error(
                 503,
-                "Neo4j Browser is not ready yet. Wait until Status is running.",
+                f"Neo4j Browser is not ready yet. {reason}",
             )
             return
 

@@ -26,6 +26,18 @@ environment_variables:
   NEO4J_NODE_PORT_HTTP:
     description: "NodePort for HTTP/Browser (used when NEO4J_SERVICE_TYPE=NodePort)"
     required: false
+  NEO4J_PLUGINS:
+    default: "[]"
+    description: 'Neo4j plugins JSON array. Example: ["apoc"] or ["apoc","graph-data-science"]. Empty [] is most reliable on first boot.'
+    required: false
+  NEO4J_MEMORY:
+    default: "2Gi"
+    description: "Memory for the Neo4j Pod. Use 4Gi when enabling graph-data-science."
+    required: false
+  NEO4J_USE_PVC:
+    default: "false"
+    description: "Persist Neo4j data on the project PVC. Set false to use ephemeral storage for troubleshooting."
+    required: false
 
 runtimes:
   - editor: PBJ Workbench
