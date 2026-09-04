@@ -48,6 +48,8 @@ def _render_status_page(info: dict) -> str:
         ("Username", info.get("username")),
         ("Password", info.get("password")),
         ("Password Source", info.get("password_source")),
+        ("Deployed NEO4J_AUTH", info.get("deployed_neo4j_auth")),
+        ("Auth In Sync", info.get("auth_in_sync")),
         ("Neo4j Browser", info.get("proxied_browser_path")),
         ("HTTP API Connect URL", info.get("http_api_connect_url")),
         ("Internal Bolt URI", info.get("internal_bolt")),

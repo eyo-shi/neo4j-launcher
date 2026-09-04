@@ -183,6 +183,31 @@ def get_neo4j_password_source() -> str:
     return "default (NEO4J_PASSWORD not set — using 'password')"
 
 
+def _get_deployment_neo4j_auth() -> str | None:
+    deployment = _get_deployment()
+    if deployment is None:
+        return None
+    container = deployment.spec.template.spec.containers[0]
+    env_by_name = {env.name: env.value for env in container.env or []}
+    return env_by_name.get("NEO4J_AUTH")
+
+
+def _mask_neo4j_auth(auth: str | None) -> str | None:
+    if not auth:
+        return None
+    username, separator, _password = auth.partition("/")
+    if not separator:
+        return auth
+    return f"{username}/***"
+
+
+def _deployment_auth_matches() -> bool:
+    deployed_auth = _get_deployment_neo4j_auth()
+    if deployed_auth is None:
+        return False
+    return deployed_auth == _expected_neo4j_auth()
+
+
 def get_owner_reference() -> client.V1OwnerReference:
     return client.V1OwnerReference(
         api_version="v1",
@@ -803,6 +828,8 @@ def _deployment_should_be_reused(
 ) -> bool:
     if deployment is None or service is None:
         return False
+    if not _deployment_config_matches():
+        return False
     if is_neo4j_server_up() or is_neo4j_http_up():
         return True
 
@@ -966,9 +993,25 @@ def get_deployment_diagnostics() -> dict:
 
 
 def deploy_neo4j_server() -> None:
-    if is_neo4j_server_up():
-        print("Neo4j is already reachable. Skipping deploy.")
+    deployment = _get_deployment()
+    if (
+        deployment is not None
+        and _deployment_config_matches()
+        and is_neo4j_server_up()
+    ):
+        print(
+            "Neo4j is already reachable with current configuration. "
+            "Skipping deploy."
+        )
         return
+
+    if deployment is not None and not _deployment_config_matches():
+        print(
+            "Neo4j deployment config is outdated "
+            f"(pod NEO4J_AUTH={_mask_neo4j_auth(_get_deployment_neo4j_auth())}, "
+            f"expected {_mask_neo4j_auth(_expected_neo4j_auth())}). "
+            "Recreating deployment..."
+        )
 
     _ensure_clean_slate()
 
@@ -1360,6 +1403,8 @@ def get_connection_info() -> dict:
         "username": credentials["username"],
         "password": credentials["password"],
         "password_source": get_neo4j_password_source(),
+        "deployed_neo4j_auth": _mask_neo4j_auth(_get_deployment_neo4j_auth()),
+        "auth_in_sync": _deployment_auth_matches(),
         "internal_bolt": None,
         "internal_browser": None,
         "external_bolt": None,
@@ -1386,6 +1431,26 @@ def get_connection_info() -> dict:
     pod_status = info.get("neo4j_pod_status") or ""
     if _pod_is_in_failure_state(pod_status):
         _maybe_print_pod_logs(info.get("neo4j_pod_logs"), pod_status)
+
+    if not _env_is_set("NEO4J_PASSWORD"):
+        warning = (
+            "NEO4J_PASSWORD is not set on this Application. "
+            "The Neo4j Pod uses the default password 'password'. "
+            "Set NEO4J_PASSWORD in the CML Application deploy screen and redeploy."
+        )
+        if not info.get("message"):
+            info["message"] = warning
+        elif warning not in info["message"]:
+            info["message"] = f"{info['message']} {warning}"
+    elif not info.get("auth_in_sync"):
+        warning = (
+            "Neo4j Pod NEO4J_AUTH does not match this Application's credentials. "
+            "The deployment will be recreated on the next bootstrap."
+        )
+        if not info.get("message"):
+            info["message"] = warning
+        elif warning not in info["message"]:
+            info["message"] = f"{info['message']} {warning}"
 
     try:
         endpoints = get_external_endpoints()
@@ -1482,6 +1547,23 @@ def _bootstrap_neo4j() -> None:
     print(f"  service={get_neo4j_service_name()}")
     print(f"  neo4j_username={get_neo4j_credentials()['username']}")
     print(f"  neo4j_password_source={get_neo4j_password_source()}")
+    if not _env_is_set("NEO4J_PASSWORD"):
+        print(
+            "  WARNING: NEO4J_PASSWORD is not set on this Application. "
+            "Neo4j Pod will use NEO4J_AUTH=neo4j/password."
+        )
+    else:
+        print(
+            "  neo4j_auth_for_deployment="
+            f"{_mask_neo4j_auth(_expected_neo4j_auth())} (from NEO4J_PASSWORD env)"
+        )
+    deployed_auth = _get_deployment_neo4j_auth()
+    if deployed_auth:
+        print(
+            "  deployed_neo4j_auth="
+            f"{_mask_neo4j_auth(deployed_auth)} "
+            f"(in_sync={_deployment_auth_matches()})"
+        )
     print(
         "  neo4j_accept_license_agreement="
         f"{_env_str('NEO4J_ACCEPT_LICENSE_AGREEMENT', 'yes')}"
@@ -1509,9 +1591,17 @@ def _bootstrap_neo4j() -> None:
     )
     print("  neo4j_container_command=(image default entrypoint, no command/args override)")
 
-    if is_neo4j_server_up():
-        print("Neo4j server is already running.")
+    if is_neo4j_server_up() and _deployment_config_matches():
+        print("Neo4j server is already running with current configuration.")
         return
+
+    if is_neo4j_server_up() and not _deployment_config_matches():
+        print(
+            "Neo4j is reachable but deployment config is outdated. "
+            f"Expected NEO4J_AUTH={_mask_neo4j_auth(_expected_neo4j_auth())}, "
+            f"deployed={_mask_neo4j_auth(_get_deployment_neo4j_auth())}. "
+            "Recreating deployment..."
+        )
 
     deploy_started_at = time.time()
     deploy_neo4j_server()
