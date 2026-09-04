@@ -253,4 +253,20 @@ if __name__ == "__main__":
     server = ReuseAddrHTTPServer((bind_host, port), Neo4jLauncherHandler)
     server.daemon_threads = True
     threading.Thread(target=run_neo4j_supervisor, daemon=True).start()
+
+    # --- 追記: 定期的に Pod ログを出力してコンテナ内のエラーを表示 ---
+    import time
+    def _log_debugger():
+        while True:
+            time.sleep(5)
+            info = get_connection_info()
+            logs = info.get("neo4j_pod_logs")
+            if logs:
+                print("\n========== [NEO4J POD LOGS TAIL] ==========")
+                print(logs)
+                print("===========================================\n")
+    
+    threading.Thread(target=_log_debugger, daemon=True).start()
+    # -----------------------------------------------------------------
+
     server.serve_forever()
