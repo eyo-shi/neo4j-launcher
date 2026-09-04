@@ -36,8 +36,11 @@ POD_FAILURE_MARKERS = (
     "OOMKilled",
     "CreateContainerConfigError",
     "InvalidImageName",
+    "Init:CrashLoopBackOff",
+    "Init:Error",
     "Error",
 )
+NO_POD_GRACE_SECONDS = 60
 
 
 def get_current_namespace() -> str:
@@ -185,7 +188,14 @@ def _neo4j_memory_settings() -> dict[str, str]:
         }
 
     total_mib = _parse_memory_to_mib(NEO4J_MEMORY)
-    overhead_mib = min(1024, max(512, total_mib // 3))
+    if total_mib <= 2304:
+        return {
+            "heap_initial": "512m",
+            "heap_max": "512m",
+            "pagecache": "256m",
+        }
+
+    overhead_mib = 1024
     usable = max(256, total_mib - overhead_mib)
     heap_mib = max(256, int(usable * 0.55))
     pagecache_mib = max(128, usable - heap_mib)
@@ -247,14 +257,6 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
                 ),
             ]
         )
-    proxy_http_address = _cml_proxy_http_advertised_address()
-    if proxy_http_address:
-        env.append(
-            client.V1EnvVar(
-                name="NEO4J_server_http_advertised__address",
-                value=proxy_http_address,
-            )
-        )
     return env
 
 
@@ -277,6 +279,52 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
         data_mount.sub_path = "neo4j-volume"
     logs_mount = client.V1VolumeMount(name="neo4j-logs", mount_path="/logs")
 
+    pod_spec = client.V1PodSpec(
+        containers=[
+            client.V1Container(
+                name="neo4j",
+                image=NEO4J_IMAGE,
+                image_pull_policy="IfNotPresent",
+                ports=[
+                    client.V1ContainerPort(
+                        container_port=7687, name="bolt"
+                    ),
+                    client.V1ContainerPort(
+                        container_port=7474, name="http"
+                    ),
+                ],
+                env=_neo4j_container_env(credentials),
+                resources=client.V1ResourceRequirements(
+                    requests={"cpu": "500m", "memory": NEO4J_MEMORY},
+                    limits={"cpu": "2", "memory": NEO4J_MEMORY},
+                ),
+                startup_probe=client.V1Probe(
+                    tcp_socket=client.V1TCPSocketAction(port=7687),
+                    period_seconds=10,
+                    failure_threshold=60,
+                ),
+                readiness_probe=client.V1Probe(
+                    tcp_socket=client.V1TCPSocketAction(port=7687),
+                    period_seconds=10,
+                    failure_threshold=20,
+                ),
+                volume_mounts=[data_mount, logs_mount],
+            )
+        ],
+        volumes=[
+            data_volume,
+            client.V1Volume(
+                name="neo4j-logs",
+                empty_dir=client.V1EmptyDirVolumeSource(),
+            ),
+        ],
+    )
+    if NEO4J_USE_PVC:
+        pod_spec.security_context = client.V1PodSecurityContext(
+            fs_group=NEO4J_CONTAINER_GID,
+            fs_group_change_policy="Always",
+        )
+
     return client.V1Deployment(
         api_version="apps/v1",
         metadata=client.V1ObjectMeta(
@@ -286,78 +334,42 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
         ),
         spec=client.V1DeploymentSpec(
             replicas=1,
+            progress_deadline_seconds=600,
             selector=client.V1LabelSelector(match_labels={"app": get_deployment_name()}),
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(labels={"app": get_deployment_name()}),
-                spec=client.V1PodSpec(
-                    security_context=client.V1PodSecurityContext(
-                        fs_group=NEO4J_CONTAINER_GID,
-                        fs_group_change_policy="Always",
-                    ),
-                    init_containers=[
-                        client.V1Container(
-                            name="volume-permissions",
-                            image=NEO4J_IMAGE,
-                            command=[
-                                "bash",
-                                "-c",
-                                (
-                                    f"chown -R {NEO4J_CONTAINER_UID}:{NEO4J_CONTAINER_GID} "
-                                    "/data /logs"
-                                ),
-                            ],
-                            volume_mounts=[data_mount, logs_mount],
-                            security_context=client.V1SecurityContext(
-                                run_as_user=0,
-                            ),
-                        )
-                    ],
-                    containers=[
-                        client.V1Container(
-                            name="neo4j",
-                            image=NEO4J_IMAGE,
-                            security_context=client.V1SecurityContext(
-                                allow_privilege_escalation=False,
-                                run_as_non_root=True,
-                                run_as_user=NEO4J_CONTAINER_UID,
-                                run_as_group=NEO4J_CONTAINER_GID,
-                            ),
-                            ports=[
-                                client.V1ContainerPort(
-                                    container_port=7687, name="bolt"
-                                ),
-                                client.V1ContainerPort(
-                                    container_port=7474, name="http"
-                                ),
-                            ],
-                            env=_neo4j_container_env(credentials),
-                            resources=client.V1ResourceRequirements(
-                                requests={"cpu": "500m", "memory": NEO4J_MEMORY},
-                                limits={"cpu": "2", "memory": NEO4J_MEMORY},
-                            ),
-                            startup_probe=client.V1Probe(
-                                tcp_socket=client.V1TCPSocketAction(port=7687),
-                                period_seconds=10,
-                                failure_threshold=60,
-                            ),
-                            readiness_probe=client.V1Probe(
-                                tcp_socket=client.V1TCPSocketAction(port=7687),
-                                period_seconds=10,
-                                failure_threshold=20,
-                            ),
-                            volume_mounts=[data_mount, logs_mount],
-                        )
-                    ],
-                    volumes=[
-                        data_volume,
-                        client.V1Volume(
-                            name="neo4j-logs",
-                            empty_dir=client.V1EmptyDirVolumeSource(),
-                        ),
-                    ],
-                ),
+                spec=pod_spec,
             ),
         ),
+    )
+
+
+def _apply_deployment_spec() -> None:
+    api_instance = client.AppsV1Api()
+    namespace = get_current_namespace()
+    body = create_deployment_spec_for_neo4j()
+    existing = _get_deployment()
+    if existing is None:
+        _create_with_conflict_retry(
+            lambda: api_instance.create_namespaced_deployment(
+                namespace=namespace,
+                body=body,
+            ),
+            _get_deployment,
+            lambda: api_instance.delete_namespaced_deployment(
+                name=get_deployment_name(),
+                namespace=namespace,
+                body=client.V1DeleteOptions(propagation_policy="Foreground"),
+            ),
+            get_deployment_name(),
+        )
+        return
+
+    print(f"Updating existing deployment {get_deployment_name()}...")
+    api_instance.replace_namespaced_deployment(
+        name=get_deployment_name(),
+        namespace=namespace,
+        body=body,
     )
 
 
@@ -517,6 +529,54 @@ def _wait_until_all_neo4j_resources_gone() -> None:
     _wait_until_gone(_get_service, get_neo4j_service_name())
 
 
+def _format_container_status(name: str, status: client.V1ContainerStatus) -> str:
+    state = status.state
+    if state.waiting:
+        return (
+            f"{name}: waiting reason={state.waiting.reason or ''} "
+            f"message={state.waiting.message or ''}"
+        )
+    if state.terminated:
+        return (
+            f"{name}: terminated reason={state.terminated.reason or ''} "
+            f"exit={state.terminated.exit_code} "
+            f"message={state.terminated.message or ''}"
+        )
+    if state.running:
+        return f"{name}: running"
+    return f"{name}: unknown"
+
+
+def _describe_pod(pod: client.V1Pod) -> str:
+    parts = [f"{pod.metadata.name}: phase={pod.status.phase}"]
+    for status in pod.status.init_container_statuses or []:
+        parts.append(_format_container_status(status.name, status))
+    for status in pod.status.container_statuses or []:
+        parts.append(_format_container_status(status.name, status))
+    return " | ".join(parts)
+
+
+def _get_recent_deployment_events(limit: int = 8) -> str | None:
+    core_api = client.CoreV1Api()
+    namespace = get_current_namespace()
+    try:
+        events = core_api.list_namespaced_event(
+            namespace=namespace,
+            field_selector=f"involvedObject.name={get_deployment_name()}",
+        )
+        lines = []
+        for event in sorted(
+            events.items,
+            key=lambda item: item.last_timestamp or item.event_time,
+        )[-limit:]:
+            lines.append(
+                f"{event.type} {event.reason}: {event.message}"
+            )
+        return "\n".join(lines) if lines else None
+    except Exception as exc:
+        return f"error reading events: {_format_k8s_error(exc)}"
+
+
 def _get_neo4j_pod_logs(tail_lines: int = 40) -> str | None:
     core_api = client.CoreV1Api()
     try:
@@ -525,13 +585,27 @@ def _get_neo4j_pod_logs(tail_lines: int = 40) -> str | None:
             label_selector=f"app={get_deployment_name()}",
         )
         if not pods.items:
-            return None
-        return core_api.read_namespaced_pod_log(
-            name=pods.items[0].metadata.name,
-            namespace=get_current_namespace(),
-            tail_lines=tail_lines,
-            container="neo4j",
-        )
+            events = _get_recent_deployment_events()
+            return events or "no pods found and no recent deployment events"
+        pod = pods.items[0]
+        log_parts: list[str] = []
+        for previous in (False, True):
+            try:
+                log = core_api.read_namespaced_pod_log(
+                    name=pod.metadata.name,
+                    namespace=get_current_namespace(),
+                    tail_lines=tail_lines,
+                    container="neo4j",
+                    previous=previous,
+                )
+                if log:
+                    suffix = " (previous)" if previous else ""
+                    log_parts.append(f"=== neo4j{suffix} ===\n{log}")
+            except ApiException:
+                continue
+        if log_parts:
+            return "\n\n".join(log_parts)
+        return _get_recent_deployment_events()
     except Exception as exc:
         return f"error reading logs: {_format_k8s_error(exc)}"
 
@@ -540,9 +614,18 @@ def _get_neo4j_pod_status_text() -> str:
     return get_deployment_diagnostics().get("neo4j_pod_status") or ""
 
 
-def _pod_is_in_failure_state(pod_status: str | None = None) -> bool:
+def _pod_is_in_failure_state(
+    pod_status: str | None = None,
+    deploy_started_at: float | None = None,
+) -> bool:
     status = pod_status if pod_status is not None else _get_neo4j_pod_status_text()
-    return any(marker in status for marker in POD_FAILURE_MARKERS)
+    if any(marker in status for marker in POD_FAILURE_MARKERS):
+        return True
+    if "no pods found" in status:
+        if deploy_started_at is None:
+            return True
+        return time.time() - deploy_started_at > NO_POD_GRACE_SECONDS
+    return False
 
 
 def _deployment_should_be_reused(
@@ -703,25 +786,13 @@ def get_deployment_diagnostics() -> dict:
         if not pods.items:
             diagnostics["neo4j_pod_status"] = "no pods found"
         else:
-            pod_lines = []
-            for pod in pods.items:
-                state = pod.status.phase
-                reason = pod.status.reason or ""
-                message = ""
-                if pod.status.container_statuses:
-                    container = pod.status.container_statuses[0]
-                    waiting = container.state.waiting
-                    if waiting:
-                        reason = waiting.reason or reason
-                        message = waiting.message or ""
-                pod_lines.append(
-                    f"{pod.metadata.name}: phase={state}, reason={reason}, message={message}"
-                )
+            pod_lines = [_describe_pod(pod) for pod in pods.items]
             diagnostics["neo4j_pod_status"] = " | ".join(pod_lines)
     except Exception as exc:
         diagnostics["neo4j_pod_status"] = f"error: {_format_k8s_error(exc)}"
 
     diagnostics["neo4j_pod_logs"] = _get_neo4j_pod_logs()
+    diagnostics["k8s_events"] = _get_recent_deployment_events()
 
     return diagnostics
 
@@ -733,24 +804,10 @@ def deploy_neo4j_server() -> None:
 
     _ensure_clean_slate()
 
-    api_instance = client.AppsV1Api()
     service_api_instance = client.CoreV1Api()
     namespace = get_current_namespace()
 
-    if _get_deployment() is None:
-        _create_with_conflict_retry(
-            lambda: api_instance.create_namespaced_deployment(
-                namespace=namespace,
-                body=create_deployment_spec_for_neo4j(),
-            ),
-            _get_deployment,
-            lambda: api_instance.delete_namespaced_deployment(
-                name=get_deployment_name(),
-                namespace=namespace,
-                body=client.V1DeleteOptions(propagation_policy="Foreground"),
-            ),
-            get_deployment_name(),
-        )
+    _apply_deployment_spec()
 
     if _get_service() is None:
         _create_with_conflict_retry(
@@ -835,10 +892,14 @@ def is_neo4j_server_up() -> bool:
 
 
 def wait_for_neo4j_server(
-    max_retries: int | None = None, sleep_duration: int = 10
+    max_retries: int | None = None,
+    sleep_duration: int = 10,
+    deploy_started_at: float | None = None,
 ) -> None:
     if max_retries is None:
         max_retries = max(1, NEO4J_STARTUP_TIMEOUT_SECONDS // sleep_duration)
+    if deploy_started_at is None:
+        deploy_started_at = time.time()
 
     credentials = get_neo4j_credentials()
     consecutive_pod_failures = 0
@@ -849,18 +910,21 @@ def wait_for_neo4j_server(
     ) as driver:
         for attempt in range(max_retries):
             pod_status = _get_neo4j_pod_status_text()
-            if _pod_is_in_failure_state(pod_status):
+            if _pod_is_in_failure_state(pod_status, deploy_started_at):
                 consecutive_pod_failures += 1
                 logs = _get_neo4j_pod_logs(tail_lines=80)
+                events = _get_recent_deployment_events()
                 print(
                     "Neo4j pod failure detected "
                     f"({consecutive_pod_failures}): {pod_status}"
                 )
                 if logs:
-                    print(f"Recent pod logs:\n{logs[-3000:]}")
+                    print(f"Recent pod logs/events:\n{logs[-3000:]}")
+                if events:
+                    print(f"Recent deployment events:\n{events[-2000:]}")
                 if consecutive_pod_failures >= 3:
                     raise RuntimeError(
-                        "Neo4j pod is crash looping or failed to start. "
+                        "Neo4j pod failed to start. "
                         f"Pod status: {pod_status}"
                     )
             else:
@@ -1100,6 +1164,7 @@ def get_connection_info() -> dict:
         "service_status": diagnostics.get("service_status"),
         "neo4j_pod_status": diagnostics.get("neo4j_pod_status"),
         "neo4j_pod_logs": diagnostics.get("neo4j_pod_logs"),
+        "k8s_events": diagnostics.get("k8s_events"),
         "pvc_claim": diagnostics.get("pvc_claim"),
         "parent_pod": diagnostics.get("parent_pod"),
     }
@@ -1200,6 +1265,7 @@ def _bootstrap_neo4j() -> None:
         return
 
     for deploy_attempt in range(2):
+        deploy_started_at = time.time()
         if deploy_attempt > 0:
             print("Redeploying Neo4j after pod failure...")
             reset_neo4j_server()
@@ -1208,10 +1274,12 @@ def _bootstrap_neo4j() -> None:
 
         _set_supervisor_state("waiting_for_neo4j")
         try:
-            wait_for_neo4j_server()
+            wait_for_neo4j_server(deploy_started_at=deploy_started_at)
             break
         except RuntimeError as exc:
-            if deploy_attempt == 0 and _pod_is_in_failure_state():
+            if deploy_attempt == 0 and _pod_is_in_failure_state(
+                deploy_started_at=deploy_started_at
+            ):
                 print(f"Initial deploy failed: {exc}")
                 continue
             if is_neo4j_http_up():

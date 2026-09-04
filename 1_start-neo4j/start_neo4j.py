@@ -42,6 +42,7 @@ def _render_status_page(info: dict) -> str:
         ("Service", info.get("service_status")),
         ("Neo4j Pod", info.get("neo4j_pod_status")),
         ("Pod Logs (tail)", info.get("neo4j_pod_logs")),
+        ("K8s Events", info.get("k8s_events")),
         ("Parent Pod", info.get("parent_pod")),
         ("PVC Claim", info.get("pvc_claim")),
         ("Username", info.get("username")),
@@ -70,6 +71,11 @@ def _render_status_page(info: dict) -> str:
             cell = (
                 f"<pre style='max-height:12rem;overflow:auto'>"
                 f"{html.escape(str(value)[-2000:])}</pre>"
+            )
+        elif label == "K8s Events" and value:
+            cell = (
+                f"<pre style='max-height:8rem;overflow:auto'>"
+                f"{html.escape(str(value)[-1500:])}</pre>"
             )
         elif label == "External Browser" and str(value).startswith("http"):
             cell = (
