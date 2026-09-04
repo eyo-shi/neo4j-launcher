@@ -16,6 +16,10 @@ environment_variables:
   NEO4J_PASSWORD:
     description: "Neo4j password"
     required: false
+  NEO4J_ACCEPT_LICENSE_AGREEMENT:
+    default: "yes"
+    description: "Must be 'yes' for Neo4j Docker images to start (license acceptance)."
+    required: false
   NEO4J_SERVICE_TYPE:
     default: "LoadBalancer"
     description: "Kubernetes Service type (LoadBalancer, NodePort, or ClusterIP)"

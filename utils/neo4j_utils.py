@@ -309,6 +309,10 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
             value=f"{credentials['username']}/{credentials['password']}",
         ),
         client.V1EnvVar(
+            name="NEO4J_ACCEPT_LICENSE_AGREEMENT",
+            value=_env_str("NEO4J_ACCEPT_LICENSE_AGREEMENT", "yes"),
+        ),
+        client.V1EnvVar(
             name="NEO4J_server_http_listen__address",
             value="0.0.0.0:7474",
         ),
@@ -484,6 +488,8 @@ def _deployment_config_matches() -> bool:
         and _deployment_uses_pvc(deployment) == NEO4J_USE_PVC
         and _deployment_plugins_env(deployment) == _neo4j_plugins_json()
         and env_by_name.get("NEO4J_AUTH") == _expected_neo4j_auth()
+        and env_by_name.get("NEO4J_ACCEPT_LICENSE_AGREEMENT")
+        == _env_str("NEO4J_ACCEPT_LICENSE_AGREEMENT", "yes")
     )
 
 
@@ -1454,6 +1460,10 @@ def _bootstrap_neo4j() -> None:
     print(f"  service={get_neo4j_service_name()}")
     print(f"  neo4j_username={get_neo4j_credentials()['username']}")
     print(f"  neo4j_password_source={get_neo4j_password_source()}")
+    print(
+        "  neo4j_accept_license_agreement="
+        f"{_env_str('NEO4J_ACCEPT_LICENSE_AGREEMENT', 'yes')}"
+    )
     print(f"  neo4j_memory={get_neo4j_memory()} (raw={os.getenv('NEO4J_MEMORY')!r})")
     print(f"  neo4j_plugins={get_neo4j_plugins_display()}")
     print(
