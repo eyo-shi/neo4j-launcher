@@ -181,7 +181,7 @@ def _resolve_neo4j_password() -> tuple[str, str]:
     if file_password:
         return file_password, f"password file ({password_file})"
 
-    return "password", "default (set NEO4J_PASSWORD or create /home/cdsw/.neo4j-password)"
+    return "Neo4jPass1234!", "default (set NEO4J_PASSWORD or create /home/cdsw/.neo4j-password)"
 
 
 def _log_launcher_neo4j_env_diagnostics() -> None:
@@ -441,7 +441,7 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     logs_mount = client.V1VolumeMount(name="neo4j-logs", mount_path="/logs")
 
     pod_spec = client.V1PodSpec(
-        security_context=client.V1PodSecurityContext(
+        # security_context=client.V1PodSecurityContext(
             fs_group=NEO4J_CONTAINER_GID,
             fs_group_change_policy="Always",
         ),
@@ -450,7 +450,7 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 name="neo4j",
                 image=NEO4J_IMAGE,
                 image_pull_policy="IfNotPresent",
-                security_context=client.V1SecurityContext(
+                #security_context=client.V1SecurityContext(
                     allow_privilege_escalation=False,
                     run_as_non_root=True,
                     run_as_user=NEO4J_CONTAINER_UID,
