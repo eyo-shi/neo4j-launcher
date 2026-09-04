@@ -15,6 +15,8 @@ _supervisor_state: dict = {
     "error": None,
     "updated_at": None,
 }
+_pod_logs_last_printed_at = 0.0
+POD_LOGS_PRINT_INTERVAL_SECONDS = 60
 
 NEO4J_IMAGE = os.getenv("NEO4J_IMAGE") or "neo4j:2026.07.1"
 NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE") or "LoadBalancer"
@@ -213,11 +215,18 @@ def _neo4j_memory_settings() -> dict[str, str]:
             "pagecache": "256m",
         }
 
-    # Neo4j needs heap + pagecache + ~1.5Gi JVM/native headroom within the pod limit.
-    overhead_mib = min(2048, max(1536, total_mib // 2))
-    usable = max(256, total_mib - overhead_mib)
-    heap_mib = min(1024, max(512, int(usable * 0.65)))
-    pagecache_mib = min(512, max(256, usable - heap_mib))
+    if total_mib <= 5120:
+        # 4Gi Pod: heap 2Gi + pagecache 1Gi + ~1Gi native/JVM headroom.
+        return {
+            "heap_initial": "2048m",
+            "heap_max": "2048m",
+            "pagecache": "1024m",
+        }
+
+    overhead_mib = 1024
+    usable = max(512, total_mib - overhead_mib)
+    heap_mib = min(4096, max(2048, int(usable * 0.65)))
+    pagecache_mib = min(2048, max(1024, usable - heap_mib))
     return {
         "heap_initial": f"{heap_mib}m",
         "heap_max": f"{heap_mib}m",
@@ -999,6 +1008,8 @@ def wait_for_neo4j_server(
                         "Neo4j pod failed to start. "
                         f"Pod status: {pod_status}"
                     )
+                time.sleep(sleep_duration)
+                continue
             else:
                 consecutive_pod_failures = 0
 
@@ -1215,6 +1226,17 @@ def get_proxy_unavailable_reason() -> str:
     return " ".join(parts) if parts else "Neo4j HTTP endpoint is not reachable yet."
 
 
+def _maybe_print_pod_logs(logs: str | None, reason: str) -> None:
+    global _pod_logs_last_printed_at
+    if not logs:
+        return
+    now = time.time()
+    if now - _pod_logs_last_printed_at < POD_LOGS_PRINT_INTERVAL_SECONDS:
+        return
+    _pod_logs_last_printed_at = now
+    print(f"=== Neo4j Pod Logs ({reason}) ===\n{logs[-8000:]}")
+
+
 def get_connection_info() -> dict:
     credentials = get_neo4j_credentials()
     supervisor = get_supervisor_state()
@@ -1242,7 +1264,13 @@ def get_connection_info() -> dict:
     }
 
     if supervisor.get("error"):
+        info["status"] = "error"
         info["message"] = f"Deployment error: {supervisor['error']}"
+        _maybe_print_pod_logs(info.get("neo4j_pod_logs"), "supervisor error")
+
+    pod_status = info.get("neo4j_pod_status") or ""
+    if _pod_is_in_failure_state(pod_status):
+        _maybe_print_pod_logs(info.get("neo4j_pod_logs"), pod_status)
 
     try:
         endpoints = get_external_endpoints()
@@ -1272,6 +1300,8 @@ def get_connection_info() -> dict:
     bolt_ready = is_neo4j_server_up()
 
     if not bolt_ready or not http_ready:
+        if info["status"] == "starting" and _pod_is_in_failure_state(pod_status):
+            info["status"] = "error"
         if not info.get("message"):
             if bolt_ready and not http_ready:
                 info["message"] = (

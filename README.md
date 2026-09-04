@@ -68,9 +68,22 @@ flowchart TB
 | `NEO4J_NODE_PORT_HTTP` | `30474` | NodePort（Browser） |
 | `NEO4J_IMAGE` | `neo4j:2026.07.1` | Neo4j イメージ |
 | `NEO4J_PLUGINS` | `[]` | プラグイン（初回起動の安定性のため空がデフォルト。例: `["apoc"]`） |
-| `NEO4J_MEMORY` | `2Gi` | Neo4j Pod のメモリ（GDS 利用時は `4Gi` 推奨） |
+| `NEO4J_MEMORY` | `4Gi` | Neo4j Pod のメモリ limit（4Gi 時は heap 2048m / pagecache 1024m を自動設定） |
+| `NEO4J_HEAP_INITIAL` | （自動） | JVM ヒープ初期サイズを手動指定する場合 |
+| `NEO4J_HEAP_MAX` | （自動） | JVM ヒープ最大サイズを手動指定する場合 |
+| `NEO4J_PAGECACHE` | （自動） | ページキャッシュサイズを手動指定する場合 |
 | `NEO4J_USE_PVC` | `false` | `true` で PVC に永続化。トラブル時は `false` で ephemeral 起動 |
 | `NEO4J_STARTUP_TIMEOUT_SECONDS` | `1200` | 初回起動の待機時間（秒） |
+
+### CML セッションのリソース
+
+Launcher（親 Pod）と Neo4j Pod（子 Pod）は同じノード上で並行動作します。**CML のセッション / Application にはメモリ 8GB・CPU 2 以上** を割り当てることを推奨します。親 Pod が 4GB のままだと、子 Pod（`NEO4J_MEMORY=4Gi`）と合わせてノード上限を超え、OOMKilled になることがあります。
+
+| Pod メモリ (`NEO4J_MEMORY`) | Heap | Page Cache |
+|---|---|---|
+| ≤ 2Gi | 512m | 256m |
+| 4Gi | 2048m | 1024m |
+| > 5Gi | 自動スケール | 自動スケール |
 
 ### AMP タスク
 

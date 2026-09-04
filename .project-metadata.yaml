@@ -50,13 +50,13 @@ tasks:
     script: 0_session-install-dependencies/install-dependencies.py
     short_summary: Install Dependencies
     kernel: python3
-    cpu: 1
-    memory: 4
+    cpu: 2
+    memory: 8
   - type: start_application
     name: Neo4j Launcher
     script: 1_start-neo4j/start_neo4j.py
     short_summary: Launch Neo4j and expose it externally.
     subdomain: neo4j-launcher
     kernel: python3
-    cpu: 1
-    memory: 4
+    cpu: 2
+    memory: 8
