@@ -1334,6 +1334,10 @@ def get_connection_info() -> dict:
 def print_connection_info() -> None:
     info = get_connection_info()
 
+    print("=== POD LOGS START ===")
+    print(info.get("neo4j_pod_logs"))
+    print("=== POD LOGS END ===")
+
     print("\n=== Neo4j Connection Info ===")
     print(f"Username: {info['username']}")
     print(f"Password: {info['password']}")
