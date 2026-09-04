@@ -470,6 +470,22 @@ def _deployment_plugins_env(deployment: client.V1Deployment) -> str | None:
     return env_by_name.get("NEO4J_PLUGINS")
 
 
+def _deployment_security_context_matches(deployment: client.V1Deployment) -> bool:
+    pod_sc = deployment.spec.template.spec.security_context
+    container = deployment.spec.template.spec.containers[0]
+    container_sc = container.security_context
+    if container.command or container.args:
+        return False
+    return (
+        pod_sc is not None
+        and pod_sc.fs_group == NEO4J_CONTAINER_GID
+        and container_sc is not None
+        and container_sc.run_as_user == NEO4J_CONTAINER_UID
+        and container_sc.run_as_group == NEO4J_CONTAINER_GID
+        and container_sc.run_as_non_root is True
+    )
+
+
 def _deployment_config_matches() -> bool:
     deployment = _get_deployment()
     if deployment is None:
@@ -490,6 +506,7 @@ def _deployment_config_matches() -> bool:
         and env_by_name.get("NEO4J_AUTH") == _expected_neo4j_auth()
         and env_by_name.get("NEO4J_ACCEPT_LICENSE_AGREEMENT")
         == _env_str("NEO4J_ACCEPT_LICENSE_AGREEMENT", "yes")
+        and _deployment_security_context_matches(deployment)
     )
 
 
@@ -1475,6 +1492,13 @@ def _bootstrap_neo4j() -> None:
         "  neo4j_heap/pagecache="
         f"{memory['heap_max']}/{memory['pagecache']}"
     )
+    print(
+        "  neo4j_security_context="
+        f"runAsUser={NEO4J_CONTAINER_UID}, runAsGroup={NEO4J_CONTAINER_GID}, "
+        f"fsGroup={NEO4J_CONTAINER_GID}, runAsNonRoot=true"
+    )
+    print("  neo4j_listen=bolt://0.0.0.0:7687, http://0.0.0.0:7474")
+    print("  neo4j_container_command=(image default entrypoint, no command/args override)")
 
     if is_neo4j_server_up():
         print("Neo4j server is already running.")
