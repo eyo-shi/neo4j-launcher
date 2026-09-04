@@ -31,8 +31,8 @@ environment_variables:
     description: 'Neo4j plugins JSON array. Example: ["apoc"] or ["apoc","graph-data-science"]. Empty [] is most reliable on first boot.'
     required: false
   NEO4J_MEMORY:
-    default: "2Gi"
-    description: "Memory for the Neo4j Pod. Use 4Gi when enabling graph-data-science."
+    default: "4Gi"
+    description: "Memory limit for the Neo4j Pod (not the CML Application memory). Examples: 4Gi, 4G, 4096Mi."
     required: false
   NEO4J_USE_PVC:
     default: "false"

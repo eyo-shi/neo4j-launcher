@@ -20,7 +20,6 @@ NEO4J_IMAGE = os.getenv("NEO4J_IMAGE") or "neo4j:2026.07.1"
 NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE") or "LoadBalancer"
 NEO4J_NODE_PORT_BOLT = int(os.getenv("NEO4J_NODE_PORT_BOLT") or "30687")
 NEO4J_NODE_PORT_HTTP = int(os.getenv("NEO4J_NODE_PORT_HTTP") or "30474")
-NEO4J_MEMORY = os.getenv("NEO4J_MEMORY") or "2Gi"
 NEO4J_PLUGINS = os.getenv("NEO4J_PLUGINS") or "[]"
 NEO4J_USE_PVC = os.getenv("NEO4J_USE_PVC", "false").lower() in ("1", "true", "yes")
 NEO4J_STARTUP_TIMEOUT_SECONDS = int(
@@ -162,6 +161,26 @@ def _cml_proxy_http_advertised_address() -> str | None:
     return parsed.hostname
 
 
+def _normalize_k8s_memory(value: str | None, default: str = "4Gi") -> str:
+    if value is None:
+        return default
+    normalized = value.strip()
+    if not normalized:
+        return default
+    if normalized.isdigit():
+        return f"{normalized}Gi"
+    upper = normalized.upper()
+    if upper.endswith("G") and not upper.endswith("GI"):
+        return f"{normalized[:-1]}Gi"
+    if upper.endswith("M") and not upper.endswith("MI"):
+        return f"{normalized[:-1]}Mi"
+    return normalized
+
+
+def get_neo4j_memory() -> str:
+    return _normalize_k8s_memory(os.getenv("NEO4J_MEMORY"), "4Gi")
+
+
 def _parse_memory_to_mib(memory: str) -> int:
     value = memory.strip()
     if value.endswith("Gi"):
@@ -186,7 +205,7 @@ def _neo4j_memory_settings() -> dict[str, str]:
             "pagecache": pagecache,
         }
 
-    total_mib = _parse_memory_to_mib(NEO4J_MEMORY)
+    total_mib = _parse_memory_to_mib(get_neo4j_memory())
     if total_mib <= 2304:
         return {
             "heap_initial": "512m",
@@ -256,24 +275,11 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
                 ),
             ]
         )
-    proxy_http_address = _cml_proxy_http_advertised_address()
-    if proxy_http_address:
-        env.extend(
-            [
-                client.V1EnvVar(
-                    name="NEO4J_server_http_advertised__address",
-                    value=proxy_http_address,
-                ),
-                client.V1EnvVar(
-                    name="NEO4J_server_http_x__forward__enabled",
-                    value="true",
-                ),
-            ]
-        )
     return env
 
 
 def create_deployment_spec_for_neo4j() -> client.V1Deployment:
+    neo4j_memory = get_neo4j_memory()
     namespace = get_current_namespace()
     credentials = get_neo4j_credentials()
 
@@ -318,8 +324,8 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 ],
                 env=_neo4j_container_env(credentials),
                 resources=client.V1ResourceRequirements(
-                    requests={"cpu": "500m", "memory": NEO4J_MEMORY},
-                    limits={"cpu": "2", "memory": NEO4J_MEMORY},
+                    requests={"cpu": "500m", "memory": neo4j_memory},
+                    limits={"cpu": "2", "memory": neo4j_memory},
                 ),
                 startup_probe=client.V1Probe(
                     tcp_socket=client.V1TCPSocketAction(port=7687),
@@ -367,32 +373,25 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     )
 
 
-def _apply_deployment_spec() -> None:
+def _create_deployment_if_missing() -> None:
     api_instance = client.AppsV1Api()
     namespace = get_current_namespace()
-    body = create_deployment_spec_for_neo4j()
-    existing = _get_deployment()
-    if existing is None:
-        _create_with_conflict_retry(
-            lambda: api_instance.create_namespaced_deployment(
-                namespace=namespace,
-                body=body,
-            ),
-            _get_deployment,
-            lambda: api_instance.delete_namespaced_deployment(
-                name=get_deployment_name(),
-                namespace=namespace,
-                body=client.V1DeleteOptions(propagation_policy="Foreground"),
-            ),
-            get_deployment_name(),
-        )
+    if _get_deployment() is not None:
+        print(f"Using existing deployment {get_deployment_name()}.")
         return
 
-    print(f"Updating existing deployment {get_deployment_name()}...")
-    api_instance.replace_namespaced_deployment(
-        name=get_deployment_name(),
-        namespace=namespace,
-        body=body,
+    _create_with_conflict_retry(
+        lambda: api_instance.create_namespaced_deployment(
+            namespace=namespace,
+            body=create_deployment_spec_for_neo4j(),
+        ),
+        _get_deployment,
+        lambda: api_instance.delete_namespaced_deployment(
+            name=get_deployment_name(),
+            namespace=namespace,
+            body=client.V1DeleteOptions(propagation_policy="Foreground"),
+        ),
+        get_deployment_name(),
     )
 
 
@@ -834,7 +833,7 @@ def deploy_neo4j_server() -> None:
     service_api_instance = client.CoreV1Api()
     namespace = get_current_namespace()
 
-    _apply_deployment_spec()
+    _create_deployment_if_missing()
 
     if _get_service() is None:
         _create_with_conflict_retry(
@@ -1301,7 +1300,7 @@ def _bootstrap_neo4j() -> None:
     print(f"  pvc_claim={get_pvc_name_from_parent_pod()}")
     print(f"  deployment={get_deployment_name()}")
     print(f"  service={get_neo4j_service_name()}")
-    print(f"  neo4j_memory={NEO4J_MEMORY}")
+    print(f"  neo4j_memory={get_neo4j_memory()} (raw={os.getenv('NEO4J_MEMORY')!r})")
     print(f"  neo4j_plugins={NEO4J_PLUGINS}")
     print(f"  neo4j_use_pvc={NEO4J_USE_PVC}")
     print(
@@ -1379,4 +1378,4 @@ def run_neo4j_supervisor() -> None:
         except Exception as exc:
             print(f"Neo4j supervisor error: {exc}")
             _set_supervisor_state("error", str(exc))
-            time.sleep(60)
+            time.sleep(300)
