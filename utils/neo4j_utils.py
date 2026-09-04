@@ -29,6 +29,16 @@ NEO4J_STARTUP_TIMEOUT_SECONDS = int(
 NEO4J_CONTAINER_UID = 7474
 NEO4J_CONTAINER_GID = 7474
 
+POD_FAILURE_MARKERS = (
+    "CrashLoopBackOff",
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "OOMKilled",
+    "CreateContainerConfigError",
+    "InvalidImageName",
+    "Error",
+)
+
 
 def get_current_namespace() -> str:
     with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
@@ -150,17 +160,52 @@ def _cml_proxy_http_advertised_address() -> str | None:
     return parsed.hostname
 
 
+def _parse_memory_to_mib(memory: str) -> int:
+    value = memory.strip()
+    if value.endswith("Gi"):
+        return int(float(value[:-2]) * 1024)
+    if value.endswith("G"):
+        return int(float(value[:-1]) * 1024)
+    if value.endswith("Mi"):
+        return int(value[:-2])
+    if value.endswith("M"):
+        return int(value[:-1])
+    raise ValueError(f"Unsupported memory value: {memory}")
+
+
+def _neo4j_memory_settings() -> dict[str, str]:
+    heap_initial = os.getenv("NEO4J_HEAP_INITIAL")
+    heap_max = os.getenv("NEO4J_HEAP_MAX")
+    pagecache = os.getenv("NEO4J_PAGECACHE")
+    if heap_initial and heap_max and pagecache:
+        return {
+            "heap_initial": heap_initial,
+            "heap_max": heap_max,
+            "pagecache": pagecache,
+        }
+
+    total_mib = _parse_memory_to_mib(NEO4J_MEMORY)
+    overhead_mib = min(1024, max(512, total_mib // 3))
+    usable = max(256, total_mib - overhead_mib)
+    heap_mib = max(256, int(usable * 0.55))
+    pagecache_mib = max(128, usable - heap_mib)
+    return {
+        "heap_initial": f"{heap_mib}m",
+        "heap_max": f"{heap_mib}m",
+        "pagecache": f"{pagecache_mib}m",
+    }
+
+
+def _plugins_include_apoc() -> bool:
+    return "apoc" in NEO4J_PLUGINS.lower()
+
+
 def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
+    memory = _neo4j_memory_settings()
     env = [
         client.V1EnvVar(
             name="NEO4J_AUTH",
             value=f"{credentials['username']}/{credentials['password']}",
-        ),
-        client.V1EnvVar(name="NEO4J_apoc_export_file_enabled", value="true"),
-        client.V1EnvVar(name="NEO4J_apoc_import_file_enabled", value="true"),
-        client.V1EnvVar(
-            name="NEO4J_apoc_import_file_use__neo4j__config",
-            value="true",
         ),
         client.V1EnvVar(
             name="NEO4J_PLUGINS",
@@ -180,17 +225,28 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
         ),
         client.V1EnvVar(
             name="NEO4J_server_memory_heap_initial__size",
-            value=os.getenv("NEO4J_HEAP_INITIAL") or "512m",
+            value=memory["heap_initial"],
         ),
         client.V1EnvVar(
             name="NEO4J_server_memory_heap_max__size",
-            value=os.getenv("NEO4J_HEAP_MAX") or "1G",
+            value=memory["heap_max"],
         ),
         client.V1EnvVar(
             name="NEO4J_server_memory_pagecache_size",
-            value=os.getenv("NEO4J_PAGECACHE") or "512m",
+            value=memory["pagecache"],
         ),
     ]
+    if _plugins_include_apoc():
+        env.extend(
+            [
+                client.V1EnvVar(name="NEO4J_apoc_export_file_enabled", value="true"),
+                client.V1EnvVar(name="NEO4J_apoc_import_file_enabled", value="true"),
+                client.V1EnvVar(
+                    name="NEO4J_apoc_import_file_use__neo4j__config",
+                    value="true",
+                ),
+            ]
+        )
     proxy_http_address = _cml_proxy_http_advertised_address()
     if proxy_http_address:
         env.append(
@@ -219,6 +275,7 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     data_mount = client.V1VolumeMount(name="neo4j-data", mount_path="/data")
     if NEO4J_USE_PVC:
         data_mount.sub_path = "neo4j-volume"
+    logs_mount = client.V1VolumeMount(name="neo4j-logs", mount_path="/logs")
 
     return client.V1Deployment(
         api_version="apps/v1",
@@ -237,6 +294,24 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                         fs_group=NEO4J_CONTAINER_GID,
                         fs_group_change_policy="Always",
                     ),
+                    init_containers=[
+                        client.V1Container(
+                            name="volume-permissions",
+                            image=NEO4J_IMAGE,
+                            command=[
+                                "bash",
+                                "-c",
+                                (
+                                    f"chown -R {NEO4J_CONTAINER_UID}:{NEO4J_CONTAINER_GID} "
+                                    "/data /logs"
+                                ),
+                            ],
+                            volume_mounts=[data_mount, logs_mount],
+                            security_context=client.V1SecurityContext(
+                                run_as_user=0,
+                            ),
+                        )
+                    ],
                     containers=[
                         client.V1Container(
                             name="neo4j",
@@ -260,19 +335,17 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                                 requests={"cpu": "500m", "memory": NEO4J_MEMORY},
                                 limits={"cpu": "2", "memory": NEO4J_MEMORY},
                             ),
-                            readiness_probe=client.V1Probe(
+                            startup_probe=client.V1Probe(
                                 tcp_socket=client.V1TCPSocketAction(port=7687),
-                                initial_delay_seconds=30,
                                 period_seconds=10,
                                 failure_threshold=60,
                             ),
-                            volume_mounts=[
-                                data_mount,
-                                client.V1VolumeMount(
-                                    name="neo4j-logs",
-                                    mount_path="/logs",
-                                ),
-                            ],
+                            readiness_probe=client.V1Probe(
+                                tcp_socket=client.V1TCPSocketAction(port=7687),
+                                period_seconds=10,
+                                failure_threshold=20,
+                            ),
+                            volume_mounts=[data_mount, logs_mount],
                         )
                     ],
                     volumes=[
@@ -461,6 +534,15 @@ def _get_neo4j_pod_logs(tail_lines: int = 40) -> str | None:
         )
     except Exception as exc:
         return f"error reading logs: {_format_k8s_error(exc)}"
+
+
+def _get_neo4j_pod_status_text() -> str:
+    return get_deployment_diagnostics().get("neo4j_pod_status") or ""
+
+
+def _pod_is_in_failure_state(pod_status: str | None = None) -> bool:
+    status = pod_status if pod_status is not None else _get_neo4j_pod_status_text()
+    return any(marker in status for marker in POD_FAILURE_MARKERS)
 
 
 def _deployment_should_be_reused(
@@ -759,12 +841,31 @@ def wait_for_neo4j_server(
         max_retries = max(1, NEO4J_STARTUP_TIMEOUT_SECONDS // sleep_duration)
 
     credentials = get_neo4j_credentials()
+    consecutive_pod_failures = 0
     with GraphDatabase.driver(
         credentials["uri"],
         auth=(credentials["username"], credentials["password"]),
         connection_timeout=5,
     ) as driver:
         for attempt in range(max_retries):
+            pod_status = _get_neo4j_pod_status_text()
+            if _pod_is_in_failure_state(pod_status):
+                consecutive_pod_failures += 1
+                logs = _get_neo4j_pod_logs(tail_lines=80)
+                print(
+                    "Neo4j pod failure detected "
+                    f"({consecutive_pod_failures}): {pod_status}"
+                )
+                if logs:
+                    print(f"Recent pod logs:\n{logs[-3000:]}")
+                if consecutive_pod_failures >= 3:
+                    raise RuntimeError(
+                        "Neo4j pod is crash looping or failed to start. "
+                        f"Pod status: {pod_status}"
+                    )
+            else:
+                consecutive_pod_failures = 0
+
             try:
                 driver.verify_connectivity()
                 return
@@ -774,11 +875,7 @@ def wait_for_neo4j_server(
                     f"({attempt + 1}/{max_retries}): {exc}"
                 )
                 if attempt % 6 == 5:
-                    diagnostics = get_deployment_diagnostics()
-                    print(
-                        "Current pod status: "
-                        f"{diagnostics.get('neo4j_pod_status')}"
-                    )
+                    print(f"Current pod status: {pod_status}")
                 time.sleep(sleep_duration)
     diagnostics = get_deployment_diagnostics()
     raise RuntimeError(
@@ -1083,6 +1180,7 @@ def print_connection_info() -> None:
 
 def _bootstrap_neo4j() -> None:
     _set_supervisor_state("deploying")
+    memory = _neo4j_memory_settings()
     print("Running deployment preflight checks...")
     print(f"  namespace={get_current_namespace()}")
     print(f"  parent_pod={get_parent_pod_name()}")
@@ -1090,24 +1188,40 @@ def _bootstrap_neo4j() -> None:
     print(f"  deployment={get_deployment_name()}")
     print(f"  service={get_neo4j_service_name()}")
     print(f"  neo4j_memory={NEO4J_MEMORY}")
+    print(f"  neo4j_plugins={NEO4J_PLUGINS}")
+    print(f"  neo4j_use_pvc={NEO4J_USE_PVC}")
+    print(
+        "  neo4j_heap/pagecache="
+        f"{memory['heap_max']}/{memory['pagecache']}"
+    )
 
     if is_neo4j_server_up():
         print("Neo4j server is already running.")
         return
 
-    deploy_neo4j_server()
-
-    _set_supervisor_state("waiting_for_neo4j")
-    try:
-        wait_for_neo4j_server()
-    except RuntimeError as exc:
-        if is_neo4j_http_up():
-            print(
-                "Bolt is not ready yet, but Neo4j HTTP is responding. "
-                f"Continuing startup: {exc}"
-            )
+    for deploy_attempt in range(2):
+        if deploy_attempt > 0:
+            print("Redeploying Neo4j after pod failure...")
+            reset_neo4j_server()
         else:
+            deploy_neo4j_server()
+
+        _set_supervisor_state("waiting_for_neo4j")
+        try:
+            wait_for_neo4j_server()
+            break
+        except RuntimeError as exc:
+            if deploy_attempt == 0 and _pod_is_in_failure_state():
+                print(f"Initial deploy failed: {exc}")
+                continue
+            if is_neo4j_http_up():
+                print(
+                    "Bolt is not ready yet, but Neo4j HTTP is responding. "
+                    f"Continuing startup: {exc}"
+                )
+                break
             raise
+
     wait_for_external_endpoint()
     try:
         configure_connectivity_addresses()
