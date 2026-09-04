@@ -313,6 +313,10 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
             value=_env_str("NEO4J_ACCEPT_LICENSE_AGREEMENT", "yes"),
         ),
         client.V1EnvVar(
+            name="NEO4J_server_default__listen__address",
+            value="0.0.0.0",
+        ),
+        client.V1EnvVar(
             name="NEO4J_server_http_listen__address",
             value="0.0.0.0:7474",
         ),
@@ -323,14 +327,6 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
         client.V1EnvVar(
             name="NEO4J_server_http_x__forward__enabled",
             value="true",
-        ),
-        client.V1EnvVar(
-            name="NEO4J_server_directories_data",
-            value="/data",
-        ),
-        client.V1EnvVar(
-            name="NEO4J_server_directories_logs",
-            value="/logs",
         ),
         client.V1EnvVar(
             name="NEO4J_server_memory_heap_initial__size",
@@ -486,6 +482,14 @@ def _deployment_security_context_matches(deployment: client.V1Deployment) -> boo
     )
 
 
+def _deployment_listen_config_matches(env_by_name: dict[str, str]) -> bool:
+    return (
+        env_by_name.get("NEO4J_server_default__listen__address") == "0.0.0.0"
+        and "NEO4J_server_directories_data" not in env_by_name
+        and "NEO4J_server_directories_logs" not in env_by_name
+    )
+
+
 def _deployment_config_matches() -> bool:
     deployment = _get_deployment()
     if deployment is None:
@@ -507,6 +511,7 @@ def _deployment_config_matches() -> bool:
         and env_by_name.get("NEO4J_ACCEPT_LICENSE_AGREEMENT")
         == _env_str("NEO4J_ACCEPT_LICENSE_AGREEMENT", "yes")
         and _deployment_security_context_matches(deployment)
+        and _deployment_listen_config_matches(env_by_name)
     )
 
 
@@ -1497,7 +1502,11 @@ def _bootstrap_neo4j() -> None:
         f"runAsUser={NEO4J_CONTAINER_UID}, runAsGroup={NEO4J_CONTAINER_GID}, "
         f"fsGroup={NEO4J_CONTAINER_GID}, runAsNonRoot=true"
     )
-    print("  neo4j_listen=bolt://0.0.0.0:7687, http://0.0.0.0:7474")
+    print(
+        "  neo4j_listen="
+        "default=0.0.0.0, bolt=0.0.0.0:7687, http=0.0.0.0:7474 "
+        "(directories: image defaults, no env override)"
+    )
     print("  neo4j_container_command=(image default entrypoint, no command/args override)")
 
     if is_neo4j_server_up():
