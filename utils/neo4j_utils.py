@@ -256,6 +256,20 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
                 ),
             ]
         )
+    proxy_http_address = _cml_proxy_http_advertised_address()
+    if proxy_http_address:
+        env.extend(
+            [
+                client.V1EnvVar(
+                    name="NEO4J_server_http_advertised__address",
+                    value=proxy_http_address,
+                ),
+                client.V1EnvVar(
+                    name="NEO4J_server_http_x__forward__enabled",
+                    value="true",
+                ),
+            ]
+        )
     return env
 
 
@@ -854,6 +868,21 @@ def is_neo4j_http_up() -> bool:
     return _first_reachable_http_url() is not None
 
 
+def wait_for_neo4j_http(
+    max_retries: int = 60,
+    sleep_duration: int = 5,
+) -> None:
+    for attempt in range(max_retries):
+        if is_neo4j_http_up():
+            return
+        print(
+            f"Neo4j HTTP is not ready yet "
+            f"({attempt + 1}/{max_retries})"
+        )
+        time.sleep(sleep_duration)
+    raise RuntimeError("Neo4j HTTP endpoint is not reachable.")
+
+
 def _all_http_url_candidates() -> list[str]:
     candidates = list(_internal_browser_url_candidates())
     core_api = client.CoreV1Api()
@@ -1209,10 +1238,17 @@ def get_connection_info() -> dict:
             f"kubectl port-forward svc/{get_neo4j_service_name()} 7474:7474 7687:7687"
         )
 
-    if not is_neo4j_server_up():
-        http_ready = is_neo4j_http_up()
+    http_ready = is_neo4j_http_up()
+    bolt_ready = is_neo4j_server_up()
+
+    if not bolt_ready or not http_ready:
         if not info.get("message"):
-            if http_ready:
+            if bolt_ready and not http_ready:
+                info["message"] = (
+                    "Neo4j Bolt is up but HTTP is not ready yet. "
+                    "Browser proxy will work once HTTP responds on port 7474."
+                )
+            elif http_ready and not bolt_ready:
                 info["message"] = (
                     "Neo4j HTTP is up but Bolt is not ready yet. "
                     "APOC/GDS plugin download can take several minutes on first start."
@@ -1308,8 +1344,9 @@ def _bootstrap_neo4j() -> None:
         configure_connectivity_addresses()
         if not is_neo4j_server_up():
             wait_for_neo4j_server(max_retries=30)
+        wait_for_neo4j_http(max_retries=60)
     except Exception as exc:
-        print(f"Failed to configure Neo4j connectivity addresses: {exc}")
+        print(f"Failed to finalize Neo4j connectivity: {exc}")
     print_connection_info()
 
 

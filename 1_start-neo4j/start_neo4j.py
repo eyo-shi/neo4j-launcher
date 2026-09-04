@@ -137,7 +137,23 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         if path in ("/launcher", "/launcher/"):
             self._serve_status_page()
             return
+        if path == "/" and method == "GET" and self._accepts_html():
+            self._redirect_to("/launcher")
+            return
         self._proxy_request(method)
+
+    def _accepts_html(self) -> bool:
+        accept = self.headers.get("Accept", "")
+        return "text/html" in accept or accept.startswith("*/*")
+
+    def _redirect_to(self, location: str) -> None:
+        body = f"Redirecting to {location}".encode("utf-8")
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_health_check(self) -> None:
         body = b"ok"
@@ -219,6 +235,7 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                 "Neo4j Browser is not ready yet. Please wait and retry.",
             )
         except Exception as exc:
+            print(f"Proxy error for {method} {self.path}: {exc}")
             self.send_error(502, f"Failed to proxy Neo4j Browser request: {exc}")
 
     def log_message(self, format: str, *args) -> None:
@@ -227,8 +244,9 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.getenv("CDSW_APP_PORT") or "8090")
+    bind_host = os.getenv("NEO4J_LAUNCHER_BIND_HOST", "0.0.0.0")
     threading.Thread(target=run_neo4j_supervisor, daemon=True).start()
-    print(f"Starting Neo4j Launcher status page on 127.0.0.1:{port}")
-    server = ThreadingHTTPServer(("127.0.0.1", port), Neo4jLauncherHandler)
+    print(f"Starting Neo4j Launcher on {bind_host}:{port}")
+    server = ThreadingHTTPServer((bind_host, port), Neo4jLauncherHandler)
     server.daemon_threads = True
     server.serve_forever()
