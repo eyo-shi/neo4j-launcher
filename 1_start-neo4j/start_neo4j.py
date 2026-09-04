@@ -47,6 +47,7 @@ def _render_status_page(info: dict) -> str:
         ("PVC Claim", info.get("pvc_claim")),
         ("Username", info.get("username")),
         ("Password", info.get("password")),
+        ("Password Source", info.get("password_source")),
         ("Neo4j Browser", info.get("proxied_browser_path")),
         ("HTTP API Connect URL", info.get("http_api_connect_url")),
         ("Internal Bolt URI", info.get("internal_bolt")),

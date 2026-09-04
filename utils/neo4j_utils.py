@@ -33,6 +33,21 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return normalized in ("1", "true", "yes", "on")
 
 
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    stripped = value.strip()
+    if not stripped:
+        return default
+    return stripped
+
+
+def _env_is_set(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and bool(value.strip())
+
+
 def _parse_neo4j_plugins() -> list[str]:
     raw = (os.getenv("NEO4J_PLUGINS") or "").strip()
     if not raw or raw.lower() in ("[]", "none", "false", "0", "null"):
@@ -147,14 +162,25 @@ def get_engine_id() -> str:
 
 
 def get_neo4j_credentials() -> dict:
-    username = os.getenv("NEO4J_USERNAME") or "neo4j"
-    password = os.getenv("NEO4J_PASSWORD") or "password"
+    username = _env_str("NEO4J_USERNAME", "neo4j")
+    password = _env_str("NEO4J_PASSWORD", "password")
     return {
         "username": username,
         "password": password,
         "uri": f"bolt://{get_neo4j_service_name()}:7687",
         "database": "neo4j",
     }
+
+
+def _expected_neo4j_auth() -> str:
+    credentials = get_neo4j_credentials()
+    return f"{credentials['username']}/{credentials['password']}"
+
+
+def get_neo4j_password_source() -> str:
+    if _env_is_set("NEO4J_PASSWORD"):
+        return "environment"
+    return "default (NEO4J_PASSWORD not set — using 'password')"
 
 
 def get_owner_reference() -> client.V1OwnerReference:
@@ -457,6 +483,7 @@ def _deployment_config_matches() -> bool:
         == expected["pagecache"]
         and _deployment_uses_pvc(deployment) == NEO4J_USE_PVC
         and _deployment_plugins_env(deployment) == _neo4j_plugins_json()
+        and env_by_name.get("NEO4J_AUTH") == _expected_neo4j_auth()
     )
 
 
@@ -926,7 +953,7 @@ def deploy_neo4j_server() -> None:
     elif not _deployment_config_matches():
         print(
             "Neo4j deployment config is outdated. "
-            "Recreating deployment with current memory settings..."
+            "Recreating deployment with current settings..."
         )
         _delete_all_neo4j_resources()
         _wait_until_all_neo4j_resources_gone()
@@ -1304,6 +1331,7 @@ def get_connection_info() -> dict:
         "status": "starting",
         "username": credentials["username"],
         "password": credentials["password"],
+        "password_source": get_neo4j_password_source(),
         "internal_bolt": None,
         "internal_browser": None,
         "external_bolt": None,
@@ -1424,6 +1452,8 @@ def _bootstrap_neo4j() -> None:
     print(f"  pvc_claim={get_pvc_name_from_parent_pod()}")
     print(f"  deployment={get_deployment_name()}")
     print(f"  service={get_neo4j_service_name()}")
+    print(f"  neo4j_username={get_neo4j_credentials()['username']}")
+    print(f"  neo4j_password_source={get_neo4j_password_source()}")
     print(f"  neo4j_memory={get_neo4j_memory()} (raw={os.getenv('NEO4J_MEMORY')!r})")
     print(f"  neo4j_plugins={get_neo4j_plugins_display()}")
     print(
