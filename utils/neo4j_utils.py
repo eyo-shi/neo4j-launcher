@@ -213,10 +213,11 @@ def _neo4j_memory_settings() -> dict[str, str]:
             "pagecache": "256m",
         }
 
-    overhead_mib = 1024
+    # Neo4j needs heap + pagecache + ~1.5Gi JVM/native headroom within the pod limit.
+    overhead_mib = min(2048, max(1536, total_mib // 2))
     usable = max(256, total_mib - overhead_mib)
-    heap_mib = max(256, int(usable * 0.55))
-    pagecache_mib = max(128, usable - heap_mib)
+    heap_mib = min(1024, max(512, int(usable * 0.65)))
+    pagecache_mib = min(512, max(256, usable - heap_mib))
     return {
         "heap_initial": f"{heap_mib}m",
         "heap_max": f"{heap_mib}m",
@@ -370,6 +371,24 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 spec=pod_spec,
             ),
         ),
+    )
+
+
+def _deployment_config_matches() -> bool:
+    deployment = _get_deployment()
+    if deployment is None:
+        return False
+
+    container = deployment.spec.template.spec.containers[0]
+    expected = _neo4j_memory_settings()
+    env_by_name = {env.name: env.value for env in container.env or []}
+    limits = container.resources.limits or {}
+    return (
+        limits.get("memory") == get_neo4j_memory()
+        and env_by_name.get("NEO4J_server_memory_heap_max__size")
+        == expected["heap_max"]
+        and env_by_name.get("NEO4J_server_memory_pagecache_size")
+        == expected["pagecache"]
     )
 
 
@@ -603,7 +622,7 @@ def _get_recent_deployment_events(limit: int = 8) -> str | None:
         return f"error reading events: {_format_k8s_error(exc)}"
 
 
-def _get_neo4j_pod_logs(tail_lines: int = 40) -> str | None:
+def _get_neo4j_pod_logs(tail_lines: int = 200) -> str | None:
     core_api = client.CoreV1Api()
     try:
         pods = core_api.list_namespaced_pod(
@@ -614,8 +633,8 @@ def _get_neo4j_pod_logs(tail_lines: int = 40) -> str | None:
             events = _get_recent_deployment_events()
             return events or "no pods found and no recent deployment events"
         pod = pods.items[0]
-        log_parts: list[str] = []
-        for previous in (False, True):
+        log_parts: list[str] = [_describe_pod(pod)]
+        for previous in (True, False):
             try:
                 log = core_api.read_namespaced_pod_log(
                     name=pod.metadata.name,
@@ -629,7 +648,7 @@ def _get_neo4j_pod_logs(tail_lines: int = 40) -> str | None:
                     log_parts.append(f"=== neo4j{suffix} ===\n{log}")
             except ApiException:
                 continue
-        if log_parts:
+        if len(log_parts) > 1:
             return "\n\n".join(log_parts)
         return _get_recent_deployment_events()
     except Exception as exc:
@@ -833,7 +852,19 @@ def deploy_neo4j_server() -> None:
     service_api_instance = client.CoreV1Api()
     namespace = get_current_namespace()
 
-    _create_deployment_if_missing()
+    deployment = _get_deployment()
+    if deployment is None:
+        _create_deployment_if_missing()
+    elif not _deployment_config_matches():
+        print(
+            "Neo4j deployment config is outdated. "
+            "Recreating deployment with current memory settings..."
+        )
+        _delete_all_neo4j_resources()
+        _wait_until_all_neo4j_resources_gone()
+        _create_deployment_if_missing()
+    else:
+        print(f"Using existing deployment {get_deployment_name()}.")
 
     if _get_service() is None:
         _create_with_conflict_retry(
@@ -1312,30 +1343,19 @@ def _bootstrap_neo4j() -> None:
         print("Neo4j server is already running.")
         return
 
-    for deploy_attempt in range(2):
-        deploy_started_at = time.time()
-        if deploy_attempt > 0:
-            print("Redeploying Neo4j after pod failure...")
-            reset_neo4j_server()
-        else:
-            deploy_neo4j_server()
+    deploy_started_at = time.time()
+    deploy_neo4j_server()
 
-        _set_supervisor_state("waiting_for_neo4j")
-        try:
-            wait_for_neo4j_server(deploy_started_at=deploy_started_at)
-            break
-        except RuntimeError as exc:
-            if deploy_attempt == 0 and _pod_is_in_failure_state(
-                deploy_started_at=deploy_started_at
-            ):
-                print(f"Initial deploy failed: {exc}")
-                continue
-            if is_neo4j_http_up():
-                print(
-                    "Bolt is not ready yet, but Neo4j HTTP is responding. "
-                    f"Continuing startup: {exc}"
-                )
-                break
+    _set_supervisor_state("waiting_for_neo4j")
+    try:
+        wait_for_neo4j_server(deploy_started_at=deploy_started_at)
+    except RuntimeError as exc:
+        if is_neo4j_http_up():
+            print(
+                "Bolt is not ready yet, but Neo4j HTTP is responding. "
+                f"Continuing startup: {exc}"
+            )
+        else:
             raise
 
     wait_for_external_endpoint()
@@ -1357,25 +1377,26 @@ def _bootstrap_neo4j() -> None:
 
 def run_neo4j_supervisor() -> None:
     print("Starting Neo4j server...")
-    while True:
-        try:
-            _set_supervisor_state("initializing")
-            _bootstrap_neo4j()
-            _set_supervisor_state("running")
-            print("Neo4j is running. Monitoring in background.")
-            while True:
-                if not is_neo4j_server_up():
-                    if is_neo4j_http_up():
-                        time.sleep(30)
-                        continue
-                    print("Neo4j server is down. Attempting to restart...")
-                    _set_supervisor_state("restarting")
-                    reset_neo4j_server()
-                    wait_for_neo4j_server()
-                    print_connection_info()
-                    _set_supervisor_state("running")
-                time.sleep(30)
-        except Exception as exc:
-            print(f"Neo4j supervisor error: {exc}")
-            _set_supervisor_state("error", str(exc))
-            time.sleep(300)
+    try:
+        _set_supervisor_state("initializing")
+        _bootstrap_neo4j()
+        _set_supervisor_state("running")
+        print("Neo4j is running. Monitoring in background.")
+        while True:
+            if not is_neo4j_server_up():
+                if is_neo4j_http_up():
+                    time.sleep(30)
+                    continue
+                print("Neo4j server is down. Attempting to restart...")
+                _set_supervisor_state("restarting")
+                reset_neo4j_server()
+                wait_for_neo4j_server()
+                print_connection_info()
+                _set_supervisor_state("running")
+            time.sleep(30)
+    except Exception as exc:
+        logs = _get_neo4j_pod_logs(tail_lines=200)
+        print(f"Neo4j supervisor error: {exc}")
+        if logs:
+            print(f"Latest Neo4j pod logs:\n{logs[-5000:]}")
+        _set_supervisor_state("error", str(exc))
