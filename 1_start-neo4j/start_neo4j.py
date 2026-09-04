@@ -242,11 +242,15 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         return
 
 
+class ReuseAddrHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
 if __name__ == "__main__":
     port = int(os.getenv("CDSW_APP_PORT") or "8090")
-    bind_host = os.getenv("NEO4J_LAUNCHER_BIND_HOST", "0.0.0.0")
-    threading.Thread(target=run_neo4j_supervisor, daemon=True).start()
+    bind_host = os.getenv("NEO4J_LAUNCHER_BIND_HOST", "127.0.0.1")
     print(f"Starting Neo4j Launcher on {bind_host}:{port}")
-    server = ThreadingHTTPServer((bind_host, port), Neo4jLauncherHandler)
+    server = ReuseAddrHTTPServer((bind_host, port), Neo4jLauncherHandler)
     server.daemon_threads = True
+    threading.Thread(target=run_neo4j_supervisor, daemon=True).start()
     server.serve_forever()

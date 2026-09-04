@@ -1344,7 +1344,13 @@ def _bootstrap_neo4j() -> None:
         configure_connectivity_addresses()
         if not is_neo4j_server_up():
             wait_for_neo4j_server(max_retries=30)
-        wait_for_neo4j_http(max_retries=60)
+        try:
+            wait_for_neo4j_http(max_retries=60)
+        except RuntimeError as exc:
+            print(
+                f"Warning: {exc} Browser proxy will become available once "
+                "Neo4j HTTP responds on port 7474."
+            )
     except Exception as exc:
         print(f"Failed to finalize Neo4j connectivity: {exc}")
     print_connection_info()
