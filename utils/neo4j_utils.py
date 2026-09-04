@@ -161,9 +161,46 @@ def get_engine_id() -> str:
     return (os.getenv("CDSW_ENGINE_ID") or "local").strip()
 
 
+def _read_secret_file(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = handle.read().strip()
+            return value or None
+    except OSError:
+        return None
+
+
+def _resolve_neo4j_password() -> tuple[str, str]:
+    if _env_is_set("NEO4J_PASSWORD"):
+        return _env_str("NEO4J_PASSWORD", "password"), "NEO4J_PASSWORD environment variable"
+
+    password_file = (
+        os.getenv("NEO4J_PASSWORD_FILE") or "/home/cdsw/.neo4j-password"
+    ).strip()
+    file_password = _read_secret_file(password_file)
+    if file_password:
+        return file_password, f"password file ({password_file})"
+
+    return "password", "default (set NEO4J_PASSWORD or create /home/cdsw/.neo4j-password)"
+
+
+def _log_launcher_neo4j_env_diagnostics() -> None:
+    print("  launcher_neo4j_env_vars:")
+    neo4j_keys = sorted(key for key in os.environ if key.startswith("NEO4J_"))
+    if not neo4j_keys:
+        print("    (none — CML Application did not inject any NEO4J_* variables)")
+        return
+    for key in neo4j_keys:
+        value = os.environ[key]
+        if "PASSWORD" in key:
+            print(f"    {key}=<set, length={len(value)}>")
+        else:
+            print(f"    {key}={value}")
+
+
 def get_neo4j_credentials() -> dict:
     username = _env_str("NEO4J_USERNAME", "neo4j")
-    password = _env_str("NEO4J_PASSWORD", "password")
+    password, _source = _resolve_neo4j_password()
     return {
         "username": username,
         "password": password,
@@ -178,9 +215,8 @@ def _expected_neo4j_auth() -> str:
 
 
 def get_neo4j_password_source() -> str:
-    if _env_is_set("NEO4J_PASSWORD"):
-        return "environment"
-    return "default (NEO4J_PASSWORD not set — using 'password')"
+    _password, source = _resolve_neo4j_password()
+    return source
 
 
 def _get_deployment_neo4j_auth() -> str | None:
@@ -361,6 +397,7 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
             name="NEO4J_server_memory_heap_max__size",
             value=memory["heap_max"],
         ),
+        # server.memory.pagecache.size -> pagecache_size (one underscore; dot only).
         client.V1EnvVar(
             name="NEO4J_server_memory_pagecache_size",
             value=memory["pagecache"],
@@ -1432,11 +1469,15 @@ def get_connection_info() -> dict:
     if _pod_is_in_failure_state(pod_status):
         _maybe_print_pod_logs(info.get("neo4j_pod_logs"), pod_status)
 
-    if not _env_is_set("NEO4J_PASSWORD"):
+    password_source = get_neo4j_password_source()
+    if password_source.startswith("default"):
+        password_file = (
+            os.getenv("NEO4J_PASSWORD_FILE") or "/home/cdsw/.neo4j-password"
+        ).strip()
         warning = (
             "NEO4J_PASSWORD is not set on this Application. "
-            "The Neo4j Pod uses the default password 'password'. "
-            "Set NEO4J_PASSWORD in the CML Application deploy screen and redeploy."
+            f"Set it in the CML Application deploy screen, or create {password_file}. "
+            "Until then the Neo4j Pod uses NEO4J_AUTH=neo4j/password."
         )
         if not info.get("message"):
             info["message"] = warning
@@ -1546,16 +1587,17 @@ def _bootstrap_neo4j() -> None:
     print(f"  deployment={get_deployment_name()}")
     print(f"  service={get_neo4j_service_name()}")
     print(f"  neo4j_username={get_neo4j_credentials()['username']}")
+    _log_launcher_neo4j_env_diagnostics()
     print(f"  neo4j_password_source={get_neo4j_password_source()}")
-    if not _env_is_set("NEO4J_PASSWORD"):
+    if get_neo4j_password_source().startswith("default"):
         print(
-            "  WARNING: NEO4J_PASSWORD is not set on this Application. "
-            "Neo4j Pod will use NEO4J_AUTH=neo4j/password."
+            "  WARNING: Neo4j Pod will use NEO4J_AUTH=neo4j/password. "
+            "Set NEO4J_PASSWORD on the Application or create /home/cdsw/.neo4j-password."
         )
     else:
         print(
             "  neo4j_auth_for_deployment="
-            f"{_mask_neo4j_auth(_expected_neo4j_auth())} (from NEO4J_PASSWORD env)"
+            f"{_mask_neo4j_auth(_expected_neo4j_auth())}"
         )
     deployed_auth = _get_deployment_neo4j_auth()
     if deployed_auth:

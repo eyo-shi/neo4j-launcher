@@ -62,7 +62,8 @@ flowchart TB
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `NEO4J_USERNAME` | `neo4j` | ユーザー名 |
-| `NEO4J_PASSWORD` | `password` | パスワード |
+| `NEO4J_PASSWORD` | `password` | Neo4j パスワード。**Application デプロイ画面**で設定（セッション設定だけでは反映されない） |
+| `NEO4J_PASSWORD_FILE` | `/home/cdsw/.neo4j-password` | `NEO4J_PASSWORD` 未設定時の代替（プロジェクト内にファイルを作成） |
 | `NEO4J_ACCEPT_LICENSE_AGREEMENT` | `yes` | Neo4j Docker 起動に必須（未設定だと exit 1 で終了） |
 | `NEO4J_SERVICE_TYPE` | `LoadBalancer` | Service タイプ (`LoadBalancer` / `NodePort` / `ClusterIP`) |
 | `NEO4J_NODE_PORT_BOLT` | `30687` | NodePort（Bolt） |
