@@ -1,3 +1,4 @@
+import json
 import os
 import socket
 import time
@@ -22,8 +23,44 @@ NEO4J_IMAGE = os.getenv("NEO4J_IMAGE") or "neo4j:2026.07.1"
 NEO4J_SERVICE_TYPE = os.getenv("NEO4J_SERVICE_TYPE") or "LoadBalancer"
 NEO4J_NODE_PORT_BOLT = int(os.getenv("NEO4J_NODE_PORT_BOLT") or "30687")
 NEO4J_NODE_PORT_HTTP = int(os.getenv("NEO4J_NODE_PORT_HTTP") or "30474")
-NEO4J_PLUGINS = os.getenv("NEO4J_PLUGINS") or "[]"
-NEO4J_USE_PVC = os.getenv("NEO4J_USE_PVC", "false").lower() in ("1", "true", "yes")
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    return normalized in ("1", "true", "yes", "on")
+
+
+def _parse_neo4j_plugins() -> list[str]:
+    raw = (os.getenv("NEO4J_PLUGINS") or "").strip()
+    if not raw or raw.lower() in ("[]", "none", "false", "0", "null"):
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(plugin).strip() for plugin in parsed if str(plugin).strip()]
+    except json.JSONDecodeError:
+        pass
+    return [plugin.strip() for plugin in raw.split(",") if plugin.strip()]
+
+
+def _neo4j_plugins_json() -> str | None:
+    plugins = _parse_neo4j_plugins()
+    if not plugins:
+        return None
+    return json.dumps(plugins)
+
+
+def get_neo4j_plugins_display() -> str:
+    plugins = _parse_neo4j_plugins()
+    if not plugins:
+        return "[] (disabled — NEO4J_PLUGINS env var omitted)"
+    return json.dumps(plugins)
+
+
+NEO4J_USE_PVC = _env_bool("NEO4J_USE_PVC", default=False)
 NEO4J_STARTUP_TIMEOUT_SECONDS = int(
     os.getenv("NEO4J_STARTUP_TIMEOUT_SECONDS") or "1200"
 )
@@ -235,7 +272,7 @@ def _neo4j_memory_settings() -> dict[str, str]:
 
 
 def _plugins_include_apoc() -> bool:
-    return "apoc" in NEO4J_PLUGINS.lower()
+    return any("apoc" in plugin.lower() for plugin in _parse_neo4j_plugins())
 
 
 def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
@@ -244,10 +281,6 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
         client.V1EnvVar(
             name="NEO4J_AUTH",
             value=f"{credentials['username']}/{credentials['password']}",
-        ),
-        client.V1EnvVar(
-            name="NEO4J_PLUGINS",
-            value=NEO4J_PLUGINS,
         ),
         client.V1EnvVar(
             name="NEO4J_server_http_listen__address",
@@ -262,6 +295,14 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
             value="true",
         ),
         client.V1EnvVar(
+            name="NEO4J_server_directories_data",
+            value="/data",
+        ),
+        client.V1EnvVar(
+            name="NEO4J_server_directories_logs",
+            value="/logs",
+        ),
+        client.V1EnvVar(
             name="NEO4J_server_memory_heap_initial__size",
             value=memory["heap_initial"],
         ),
@@ -274,6 +315,9 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
             value=memory["pagecache"],
         ),
     ]
+    plugins_json = _neo4j_plugins_json()
+    if plugins_json:
+        env.append(client.V1EnvVar(name="NEO4J_PLUGINS", value=plugins_json))
     if _plugins_include_apoc():
         env.extend(
             [
@@ -383,6 +427,19 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     )
 
 
+def _deployment_uses_pvc(deployment: client.V1Deployment) -> bool:
+    for volume in deployment.spec.template.spec.volumes or []:
+        if volume.name == "neo4j-data":
+            return volume.persistent_volume_claim is not None
+    return False
+
+
+def _deployment_plugins_env(deployment: client.V1Deployment) -> str | None:
+    container = deployment.spec.template.spec.containers[0]
+    env_by_name = {env.name: env.value for env in container.env or []}
+    return env_by_name.get("NEO4J_PLUGINS")
+
+
 def _deployment_config_matches() -> bool:
     deployment = _get_deployment()
     if deployment is None:
@@ -398,6 +455,8 @@ def _deployment_config_matches() -> bool:
         == expected["heap_max"]
         and env_by_name.get("NEO4J_server_memory_pagecache_size")
         == expected["pagecache"]
+        and _deployment_uses_pvc(deployment) == NEO4J_USE_PVC
+        and _deployment_plugins_env(deployment) == _neo4j_plugins_json()
     )
 
 
@@ -1366,8 +1425,12 @@ def _bootstrap_neo4j() -> None:
     print(f"  deployment={get_deployment_name()}")
     print(f"  service={get_neo4j_service_name()}")
     print(f"  neo4j_memory={get_neo4j_memory()} (raw={os.getenv('NEO4J_MEMORY')!r})")
-    print(f"  neo4j_plugins={NEO4J_PLUGINS}")
-    print(f"  neo4j_use_pvc={NEO4J_USE_PVC}")
+    print(f"  neo4j_plugins={get_neo4j_plugins_display()}")
+    print(
+        "  neo4j_data_volume="
+        f"{'pvc:' + get_pvc_name_from_parent_pod() if NEO4J_USE_PVC else 'emptyDir (ephemeral, no PVC)'}"
+    )
+    print(f"  neo4j_use_pvc={NEO4J_USE_PVC} (raw={os.getenv('NEO4J_USE_PVC')!r})")
     print(
         "  neo4j_heap/pagecache="
         f"{memory['heap_max']}/{memory['pagecache']}"
