@@ -474,7 +474,7 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 #    run_as_group=NEO4J_CONTAINER_GID,
                 #),
                 security_context=client.V1SecurityContext(
-                    run_as_non_root=False,
+                #    run_as_non_root=False,
                     allow_privilege_escalation=True,
                 ),
                 ports=[
