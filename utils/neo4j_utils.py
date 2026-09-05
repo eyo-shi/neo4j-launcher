@@ -189,13 +189,39 @@ def _log_launcher_neo4j_env_diagnostics() -> None:
             print(f"    {key}={value}")
 
 
+def get_neo4j_bolt_uri() -> str:
+    service_name = get_neo4j_service_name()
+    namespace = get_current_namespace()
+    return f"bolt://{service_name}.{namespace}.svc.cluster.local:7687"
+
+
+def _bolt_host_candidates() -> list[str]:
+    service_name = get_neo4j_service_name()
+    namespace = get_current_namespace()
+    return [
+        f"{service_name}.{namespace}.svc.cluster.local",
+        f"{service_name}.{namespace}",
+        service_name,
+    ]
+
+
+def _is_bolt_port_open(timeout: float = 3.0) -> bool:
+    for host in _bolt_host_candidates():
+        try:
+            with socket.create_connection((host, 7687), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def get_neo4j_credentials() -> dict:
     username = _env_str("NEO4J_USERNAME", DEFAULT_NEO4J_USERNAME)
     password, _source = _resolve_neo4j_password()
     return {
         "username": username,
         "password": password,
-        "uri": f"bolt://{get_neo4j_service_name()}:7687",
+        "uri": get_neo4j_bolt_uri(),
         "database": "neo4j",
     }
 
@@ -592,6 +618,9 @@ def _create_deployment_if_missing() -> None:
         ),
         get_deployment_name(),
     )
+    print(f"Created deployment {get_deployment_name()}.")
+    _log_deployment_rollout_status("after create")
+    _wait_for_neo4j_pod_scheduled()
 
 
 def create_service_spec_for_neo4j() -> client.V1Service:
@@ -778,20 +807,29 @@ def _describe_pod(pod: client.V1Pod) -> str:
 
 
 def _get_recent_deployment_events(limit: int = 8) -> str | None:
+    return _get_recent_neo4j_k8s_events(limit=limit)
+
+
+def _get_recent_neo4j_k8s_events(limit: int = 20) -> str | None:
     core_api = client.CoreV1Api()
     namespace = get_current_namespace()
+    deployment_name = get_deployment_name()
+    lines: list[str] = []
     try:
-        events = core_api.list_namespaced_event(
-            namespace=namespace,
-            field_selector=f"involvedObject.name={get_deployment_name()}",
-        )
-        lines = []
+        events = core_api.list_namespaced_event(namespace=namespace)
+        relevant = [
+            event
+            for event in events.items
+            if deployment_name in (event.involved_object.name or "")
+        ]
         for event in sorted(
-            events.items,
+            relevant,
             key=lambda item: item.last_timestamp or item.event_time,
         )[-limit:]:
+            involved = event.involved_object
             lines.append(
-                f"{event.type} {event.reason}: {event.message}"
+                f"{event.type} {event.reason} "
+                f"[{involved.kind}/{involved.name}]: {event.message}"
             )
         return "\n".join(lines) if lines else None
     except ApiException as exc:
@@ -802,6 +840,105 @@ def _get_recent_deployment_events(limit: int = 8) -> str | None:
         return f"error reading events: {_format_k8s_error(exc)}"
 
 
+def _get_replicaset_status_text() -> str | None:
+    apps_api = client.AppsV1Api()
+    namespace = get_current_namespace()
+    try:
+        replica_sets = apps_api.list_namespaced_replica_set(
+            namespace=namespace,
+            label_selector=f"app={get_deployment_name()}",
+        )
+        if not replica_sets.items:
+            return "no ReplicaSets found"
+        lines = []
+        for replica_set in replica_sets.items:
+            status = replica_set.status
+            lines.append(
+                f"{replica_set.metadata.name}: "
+                f"replicas={status.replicas or 0}, "
+                f"ready={status.ready_replicas or 0}, "
+                f"available={status.available_replicas or 0}"
+            )
+        return " | ".join(lines)
+    except Exception as exc:
+        return f"error reading ReplicaSets: {_format_k8s_error(exc)}"
+
+
+def _get_service_endpoints_text() -> str | None:
+    core_api = client.CoreV1Api()
+    try:
+        endpoints = core_api.read_namespaced_endpoints(
+            name=get_neo4j_service_name(),
+            namespace=get_current_namespace(),
+        )
+        addresses: list[str] = []
+        for subset in endpoints.subsets or []:
+            for address in subset.addresses or []:
+                if address.ip:
+                    addresses.append(address.ip)
+        if not addresses:
+            return "no ready endpoints"
+        return ", ".join(addresses)
+    except ApiException as exc:
+        if exc.status == 404:
+            return "endpoints not found"
+        return f"error reading endpoints: {_format_k8s_error(exc)}"
+    except Exception as exc:
+        return f"error reading endpoints: {_format_k8s_error(exc)}"
+
+
+def _get_neo4j_rollout_diagnostics() -> str:
+    parts: list[str] = []
+    deployment = _get_deployment()
+    if deployment is None:
+        parts.append("Deployment: not found")
+    else:
+        available = deployment.status.available_replicas or 0
+        desired = deployment.spec.replicas or 0
+        parts.append(
+            "Deployment: "
+            f"{available}/{desired} available, "
+            f"conditions={deployment.status.conditions}"
+        )
+    replica_set_status = _get_replicaset_status_text()
+    if replica_set_status:
+        parts.append(f"ReplicaSets: {replica_set_status}")
+    endpoint_status = _get_service_endpoints_text()
+    if endpoint_status:
+        parts.append(f"Service endpoints: {endpoint_status}")
+    pods = _list_neo4j_pods()
+    if pods:
+        parts.append(
+            "Pods: " + " | ".join(_describe_pod(pod) for pod in pods)
+        )
+    else:
+        parts.append("Pods: no pods found for label app=" + get_deployment_name())
+    events = _get_recent_neo4j_k8s_events()
+    if events:
+        parts.append(f"Recent events:\n{events}")
+    return "\n".join(parts)
+
+
+def _log_deployment_rollout_status(context: str) -> None:
+    print(f"Neo4j rollout status ({context}):")
+    print(_get_neo4j_rollout_diagnostics())
+
+
+def _wait_for_neo4j_pod_scheduled(timeout_seconds: int = 180) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        pods = _list_neo4j_pods()
+        if pods:
+            print(
+                "Neo4j pod scheduled: "
+                + " | ".join(_describe_pod(pod) for pod in pods)
+            )
+            return True
+        time.sleep(5)
+    _log_deployment_rollout_status("pod not scheduled yet")
+    return False
+
+
 def _get_neo4j_pod_logs(tail_lines: int = 200) -> str | None:
     core_api = client.CoreV1Api()
     try:
@@ -810,8 +947,7 @@ def _get_neo4j_pod_logs(tail_lines: int = 200) -> str | None:
             label_selector=f"app={get_deployment_name()}",
         )
         if not pods.items:
-            events = _get_recent_deployment_events()
-            return events or "no pods found and no recent deployment events"
+            return _get_neo4j_rollout_diagnostics()
         pod = pods.items[0]
         log_parts: list[str] = [_describe_pod(pod)]
         for previous in (True, False):
@@ -1111,6 +1247,7 @@ def deploy_neo4j_server() -> None:
         _create_deployment_if_missing()
     else:
         print(f"Using existing deployment {get_deployment_name()}.")
+        _log_deployment_rollout_status("using existing deployment")
 
     if _get_service() is None:
         _create_with_conflict_retry(
@@ -1125,6 +1262,8 @@ def deploy_neo4j_server() -> None:
             ),
             get_neo4j_service_name(),
         )
+
+    _log_deployment_rollout_status("after deploy")
 
 
 def stop_neo4j_server() -> None:
@@ -1249,6 +1388,25 @@ def wait_for_neo4j_server(
                 time.sleep(sleep_duration)
                 continue
             consecutive_fatal_pod_failures = 0
+
+            if is_neo4j_http_up():
+                print(
+                    f"Neo4j HTTP is up; waiting for Bolt "
+                    f"({attempt + 1}/{max_retries})"
+                )
+                time.sleep(sleep_duration)
+                continue
+
+            if not _is_bolt_port_open():
+                print(
+                    f"Neo4j Bolt port is not open yet "
+                    f"({attempt + 1}/{max_retries}); "
+                    f"pod_status={pod_status}"
+                )
+                if attempt % 6 == 5:
+                    _log_deployment_rollout_status("waiting for Bolt port")
+                time.sleep(sleep_duration)
+                continue
 
             try:
                 driver.verify_connectivity()

@@ -257,18 +257,22 @@ if __name__ == "__main__":
     server.daemon_threads = True
     threading.Thread(target=run_neo4j_supervisor, daemon=True).start()
 
-    # --- 追記: 定期的に Pod ログを出力してコンテナ内のエラーを表示 ---
+    # --- 追記: 定期的に Pod / ロールアウト状態を出力 ---
     import time
+
     def _log_debugger():
+        last_message = None
         while True:
-            time.sleep(5)
+            time.sleep(30)
             info = get_connection_info()
             logs = info.get("neo4j_pod_logs")
-            if logs:
-                print("\n========== [NEO4J POD LOGS TAIL] ==========")
-                print(logs)
-                print("===========================================\n")
-    
+            if not logs or logs == last_message:
+                continue
+            last_message = logs
+            print("\n========== [NEO4J POD LOGS TAIL] ==========")
+            print(logs)
+            print("===========================================\n")
+
     threading.Thread(target=_log_debugger, daemon=True).start()
     # -----------------------------------------------------------------
 
