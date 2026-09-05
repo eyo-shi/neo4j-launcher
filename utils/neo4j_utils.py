@@ -456,6 +456,10 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 #    run_as_user=NEO4J_CONTAINER_UID,
                 #    run_as_group=NEO4J_CONTAINER_GID,
                 #),
+                security_context=client.V1SecurityContext(
+                    run_as_non_root=False,
+                    allow_privilege_escalation=True,
+                ),
                 ports=[
                     client.V1ContainerPort(
                         container_port=7687, name="bolt"
