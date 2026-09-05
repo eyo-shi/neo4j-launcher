@@ -14,11 +14,7 @@ environment_variables:
     description: "Neo4j username"
     required: false
   NEO4J_PASSWORD:
-    description: "Neo4j password for the child Pod. Must be set on the Application deploy screen."
-    required: false
-  NEO4J_PASSWORD_FILE:
-    default: "/home/cdsw/.neo4j-password"
-    description: "Fallback password file when NEO4J_PASSWORD is not injected by CML."
+    description: "Neo4j password. When unset, the built-in default Neo4jPass1234 is used."
     required: false
   NEO4J_ACCEPT_LICENSE_AGREEMENT:
     default: "yes"

@@ -62,8 +62,7 @@ flowchart TB
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `NEO4J_USERNAME` | `neo4j` | ユーザー名 |
-| `NEO4J_PASSWORD` | `password` | Neo4j パスワード。**Application デプロイ画面**で設定（セッション設定だけでは反映されない） |
-| `NEO4J_PASSWORD_FILE` | `/home/cdsw/.neo4j-password` | `NEO4J_PASSWORD` 未設定時の代替（プロジェクト内にファイルを作成） |
+| `NEO4J_PASSWORD` | `Neo4jPass1234` | パスワード。Configuration 画面で未設定の場合は `neo4j` / `Neo4jPass1234` を使用 |
 | `NEO4J_ACCEPT_LICENSE_AGREEMENT` | `yes` | Neo4j Docker 起動に必須（未設定だと exit 1 で終了） |
 | `NEO4J_SERVICE_TYPE` | `LoadBalancer` | Service タイプ (`LoadBalancer` / `NodePort` / `ClusterIP`) |
 | `NEO4J_NODE_PORT_BOLT` | `30687` | NodePort（Bolt） |
@@ -103,7 +102,7 @@ Launcher（親 Pod）と Neo4j Pod（子 Pod）は同じノード上で並行動
 ```
 === Neo4j Connection Info ===
 Username: neo4j
-Password: password
+Password: Neo4jPass1234
 Internal Bolt URI: bolt://cml-neo4j-<engine-id>.<namespace>:7687
 Internal Browser:  http://cml-neo4j-<engine-id>.<namespace>:7474
 External Bolt URI: bolt://<external-host>:7687
