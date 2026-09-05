@@ -472,6 +472,7 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 image=NEO4J_IMAGE,
                 image_pull_policy="IfNotPresent",
                 # run_as_user/run_as_group のみ指定 (run_as_non_root は書かない)
+                command=["/bin/sh", "-c", "sleep infinity"],
                 security_context=client.V1SecurityContext(
                     run_as_user=NEO4J_CONTAINER_UID,
                     run_as_group=NEO4J_CONTAINER_GID,
