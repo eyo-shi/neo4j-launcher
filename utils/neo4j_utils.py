@@ -452,9 +452,11 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     else:
         data_volume.empty_dir = client.V1EmptyDirVolumeSource()
 
-    data_mount = client.V1VolumeMount(name="neo4j-data", mount_path="/data")
-    if NEO4J_USE_PVC:
-        data_mount.sub_path = "neo4j-volume"
+    data_mount = client.V1VolumeMount(
+        name="neo4j-data",
+        mount_path="/data",
+        sub_path="neo4j-volume" if NEO4J_USE_PVC else "data",
+    )
 
     pod_spec = client.V1PodSpec(
         security_context=client.V1PodSecurityContext(
