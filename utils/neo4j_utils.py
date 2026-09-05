@@ -84,17 +84,17 @@ NEO4J_CONTAINER_GID = 7474
 DEFAULT_NEO4J_USERNAME = "neo4j"
 DEFAULT_NEO4J_PASSWORD = "Neo4jPass1234"
 
-POD_FAILURE_MARKERS = (
+POD_FAILURE_WAITING_REASONS = (
     "CrashLoopBackOff",
     "ImagePullBackOff",
     "ErrImagePull",
-    "OOMKilled",
     "CreateContainerConfigError",
+    "InvalidImageName",
+    "RunContainerError",
     "Init:CrashLoopBackOff",
     "Init:Error",
-    "Error",
 )
-NO_POD_GRACE_SECONDS = 60
+POD_FATAL_FAILURE_THRESHOLD = 5
 
 
 def get_current_namespace() -> str:
@@ -835,22 +835,66 @@ def _get_neo4j_pod_logs(tail_lines: int = 200) -> str | None:
         return f"error reading logs: {_format_k8s_error(exc)}"
 
 
+def _list_neo4j_pods() -> list:
+    try:
+        pods = client.CoreV1Api().list_namespaced_pod(
+            namespace=get_current_namespace(),
+            label_selector=f"app={get_deployment_name()}",
+        )
+        return pods.items
+    except Exception:
+        return []
+
+
+def _container_has_fatal_failure(status: client.V1ContainerStatus) -> bool:
+    state = status.state
+    if state.waiting and state.waiting.reason in POD_FAILURE_WAITING_REASONS:
+        return True
+    if state.terminated:
+        reason = state.terminated.reason or ""
+        exit_code = state.terminated.exit_code or 0
+        if reason in ("OOMKilled", "Error", "ContainerCannotRun"):
+            return True
+        if exit_code != 0 and reason not in ("Completed",):
+            return True
+    return False
+
+
+def _pod_has_fatal_failure(pod: client.V1Pod) -> bool:
+    if pod.status.phase == "Failed":
+        return True
+    for status in pod.status.init_container_statuses or []:
+        if _container_has_fatal_failure(status):
+            return True
+    for status in pod.status.container_statuses or []:
+        if status.name == "neo4j" and _container_has_fatal_failure(status):
+            return True
+    return False
+
+
+def _neo4j_pod_fatal_failure_status() -> str | None:
+    for pod in _list_neo4j_pods():
+        if _pod_has_fatal_failure(pod):
+            return _describe_pod(pod)
+    return None
+
+
 def _get_neo4j_pod_status_text() -> str:
-    return get_deployment_diagnostics().get("neo4j_pod_status") or ""
+    pods = _list_neo4j_pods()
+    if not pods:
+        return "no pods found"
+    return " | ".join(_describe_pod(pod) for pod in pods)
 
 
 def _pod_is_in_failure_state(
     pod_status: str | None = None,
     deploy_started_at: float | None = None,
 ) -> bool:
-    status = pod_status if pod_status is not None else _get_neo4j_pod_status_text()
-    if any(marker in status for marker in POD_FAILURE_MARKERS):
+    fatal_status = _neo4j_pod_fatal_failure_status()
+    if fatal_status:
         return True
-    if "no pods found" in status:
-        if deploy_started_at is None:
-            return True
-        return time.time() - deploy_started_at > NO_POD_GRACE_SECONDS
-    return False
+    status = pod_status if pod_status is not None else _get_neo4j_pod_status_text()
+    return any(marker in status for marker in POD_FAILURE_WAITING_REASONS)
 
 
 def _deployment_should_be_reused(
@@ -866,18 +910,22 @@ def _deployment_should_be_reused(
         return True
 
     failure_or_stuck = (
-        "no pods found",
         "FailedScheduling",
         "CrashLoopBackOff",
         "ImagePullBackOff",
         "ErrImagePull",
         "OOMKilled",
-        "Error",
         "CreateContainerConfigError",
         "InvalidImageName",
+        "phase=Failed",
+        "terminated reason=Error",
+        "terminated reason=ContainerCannotRun",
     )
     if any(marker in pod_status for marker in failure_or_stuck):
         return False
+
+    if deployment is not None and service is not None:
+        return True
 
     starting_markers = ("ContainerCreating", "PodInitializing", "Running")
     return any(marker in pod_status for marker in starting_markers)
@@ -1172,7 +1220,7 @@ def wait_for_neo4j_server(
         deploy_started_at = time.time()
 
     credentials = get_neo4j_credentials()
-    consecutive_pod_failures = 0
+    consecutive_fatal_pod_failures = 0
     with GraphDatabase.driver(
         credentials["uri"],
         auth=(credentials["username"], credentials["password"]),
@@ -1180,27 +1228,27 @@ def wait_for_neo4j_server(
     ) as driver:
         for attempt in range(max_retries):
             pod_status = _get_neo4j_pod_status_text()
-            if _pod_is_in_failure_state(pod_status, deploy_started_at):
-                consecutive_pod_failures += 1
+            fatal_status = _neo4j_pod_fatal_failure_status()
+            if fatal_status:
+                consecutive_fatal_pod_failures += 1
                 logs = _get_neo4j_pod_logs(tail_lines=80)
                 events = _get_recent_deployment_events()
                 print(
-                    "Neo4j pod failure detected "
-                    f"({consecutive_pod_failures}): {pod_status}"
+                    "Neo4j pod fatal failure detected "
+                    f"({consecutive_fatal_pod_failures}): {fatal_status}"
                 )
                 if logs:
                     print(f"Recent pod logs/events:\n{logs[-3000:]}")
                 if events:
                     print(f"Recent deployment events:\n{events[-2000:]}")
-                if consecutive_pod_failures >= 3:
+                if consecutive_fatal_pod_failures >= POD_FATAL_FAILURE_THRESHOLD:
                     raise RuntimeError(
                         "Neo4j pod failed to start. "
-                        f"Pod status: {pod_status}"
+                        f"Pod status: {fatal_status}"
                     )
                 time.sleep(sleep_duration)
                 continue
-            else:
-                consecutive_pod_failures = 0
+            consecutive_fatal_pod_failures = 0
 
             try:
                 driver.verify_connectivity()
