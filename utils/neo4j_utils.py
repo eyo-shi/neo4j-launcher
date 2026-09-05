@@ -466,10 +466,6 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 name="neo4j",
                 image=NEO4J_IMAGE,
                 image_pull_policy="IfNotPresent",
-                security_context=client.V1SecurityContext(
-                    run_as_user=NEO4J_CONTAINER_UID,
-                    run_as_group=NEO4J_CONTAINER_GID,
-                ),
                 ports=[
                     client.V1ContainerPort(
                         container_port=7687, name="bolt"
