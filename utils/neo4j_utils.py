@@ -357,11 +357,11 @@ def _neo4j_memory_settings() -> dict[str, str]:
         }
 
     if total_mib <= 5120:
-        # 4Gi Pod: heap 2Gi + pagecache 1Gi + ~1Gi native/JVM headroom.
+        # 4Gi limit: leave ~1.5Gi for JVM native/off-heap (heap+pagecache alone can OOM).
         return {
-            "heap_initial": "2048m",
-            "heap_max": "2048m",
-            "pagecache": "1024m",
+            "heap_initial": "1280m",
+            "heap_max": "1280m",
+            "pagecache": "512m",
         }
 
     overhead_mib = 1024
@@ -455,12 +455,22 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     data_mount = client.V1VolumeMount(name="neo4j-data", mount_path="/data")
     if NEO4J_USE_PVC:
         data_mount.sub_path = "neo4j-volume"
-    logs_mount = client.V1VolumeMount(name="neo4j-logs", mount_path="/logs")
 
     pod_spec = client.V1PodSpec(
         security_context=client.V1PodSecurityContext(
             fs_group=NEO4J_CONTAINER_GID,
+            fs_group_change_policy="Always",
         ),
+        init_containers=[
+            client.V1Container(
+                name="fix-data-permissions",
+                image=NEO4J_IMAGE,
+                image_pull_policy="IfNotPresent",
+                command=["chown", "-R", "7474:7474", "/data"],
+                security_context=client.V1SecurityContext(run_as_user=0),
+                volume_mounts=[data_mount],
+            )
+        ],
         containers=[
             client.V1Container(
                 name="neo4j",
@@ -494,15 +504,11 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                     period_seconds=10,
                     failure_threshold=20,
                 ),
-                volume_mounts=[data_mount, logs_mount],
+                volume_mounts=[data_mount],
             )
         ],
         volumes=[
             data_volume,
-            client.V1Volume(
-                name="neo4j-logs",
-                empty_dir=client.V1EmptyDirVolumeSource(),
-            ),
         ],
     )
 
@@ -543,6 +549,16 @@ def _deployment_plugins_env(deployment: client.V1Deployment) -> str | None:
     return env_by_name.get("NEO4J_PLUGINS")
 
 
+def _deployment_volume_layout_matches(deployment: client.V1Deployment) -> bool:
+    pod_spec = deployment.spec.template.spec
+    volume_names = {volume.name for volume in pod_spec.volumes or []}
+    if "neo4j-logs" in volume_names:
+        return False
+    container = pod_spec.containers[0]
+    mount_paths = {mount.mount_path for mount in container.volume_mounts or []}
+    return mount_paths == {"/data"}
+
+
 def _deployment_security_context_matches(deployment: client.V1Deployment) -> bool:
     pod_sc = deployment.spec.template.spec.security_context
     container = deployment.spec.template.spec.containers[0]
@@ -552,6 +568,7 @@ def _deployment_security_context_matches(deployment: client.V1Deployment) -> boo
     return (
         pod_sc is not None
         and pod_sc.fs_group == NEO4J_CONTAINER_GID
+        and pod_sc.fs_group_change_policy == "Always"
         and container_sc is not None
         and container_sc.run_as_user == NEO4J_CONTAINER_UID
         and container_sc.run_as_group == NEO4J_CONTAINER_GID
@@ -588,6 +605,7 @@ def _deployment_config_matches() -> bool:
         and env_by_name.get("NEO4J_ACCEPT_LICENSE_AGREEMENT")
         == _env_str("NEO4J_ACCEPT_LICENSE_AGREEMENT", "yes")
         and _deployment_security_context_matches(deployment)
+        and _deployment_volume_layout_matches(deployment)
         and _deployment_listen_config_matches(env_by_name)
     )
 
@@ -776,10 +794,18 @@ def _wait_until_all_neo4j_resources_gone() -> None:
 def _format_container_status(name: str, status: client.V1ContainerStatus) -> str:
     state = status.state
     if state.waiting:
-        return (
+        detail = (
             f"{name}: waiting reason={state.waiting.reason or ''} "
             f"message={state.waiting.message or ''}"
         )
+        last = status.last_state
+        if last and last.terminated:
+            detail += (
+                f" | last_terminated reason={last.terminated.reason or ''} "
+                f"exit={last.terminated.exit_code} "
+                f"message={last.terminated.message or ''}"
+            )
+        return detail
     if state.terminated:
         return (
             f"{name}: terminated reason={state.terminated.reason or ''} "
@@ -874,6 +900,8 @@ def _get_service_endpoints_text() -> str | None:
             return "no ready endpoints"
         return ", ".join(addresses)
     except ApiException as exc:
+        if exc.status == 403:
+            return "forbidden (RBAC: cannot read endpoints)"
         if exc.status == 404:
             return "endpoints not found"
         return f"error reading endpoints: {_format_k8s_error(exc)}"
@@ -960,7 +988,10 @@ def _get_neo4j_pod_logs(tail_lines: int = 200) -> str | None:
                 continue
         if len(log_parts) > 1:
             return "\n\n".join(log_parts)
-        return _get_recent_deployment_events()
+        events = _get_recent_deployment_events()
+        if events:
+            return f"{log_parts[0]}\n\nRecent events:\n{events}"
+        return log_parts[0]
     except Exception as exc:
         return f"error reading logs: {_format_k8s_error(exc)}"
 
@@ -1364,14 +1395,16 @@ def wait_for_neo4j_server(
             fatal_status = _neo4j_pod_fatal_failure_status()
             if fatal_status:
                 consecutive_fatal_pod_failures += 1
-                logs = _get_neo4j_pod_logs(tail_lines=80)
+                logs = _get_neo4j_pod_logs(tail_lines=200)
                 events = _get_recent_deployment_events()
                 print(
                     "Neo4j pod fatal failure detected "
                     f"({consecutive_fatal_pod_failures}): {fatal_status}"
                 )
                 if logs:
-                    print(f"Recent pod logs/events:\n{logs[-3000:]}")
+                    print(f"Recent pod logs/events:\n{logs[-8000:]}")
+                else:
+                    print("Recent pod logs/events: unavailable")
                 if events:
                     print(f"Recent deployment events:\n{events[-2000:]}")
                 if consecutive_fatal_pod_failures >= POD_FATAL_FAILURE_THRESHOLD:
@@ -1806,7 +1839,7 @@ def _bootstrap_neo4j() -> None:
     print(
         "  neo4j_security_context="
         f"runAsUser={NEO4J_CONTAINER_UID}, runAsGroup={NEO4J_CONTAINER_GID}, "
-        f"fsGroup={NEO4J_CONTAINER_GID}, runAsNonRoot=true"
+        f"fsGroup={NEO4J_CONTAINER_GID}, fsGroupChangePolicy=Always, runAsNonRoot=true"
     )
     print(
         "  neo4j_listen="

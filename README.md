@@ -83,7 +83,7 @@ Launcher（親 Pod）と Neo4j Pod（子 Pod）は同じノード上で並行動
 | Pod メモリ (`NEO4J_MEMORY`) | Heap | Page Cache |
 |---|---|---|
 | ≤ 2Gi | 512m | 256m |
-| 4Gi | 2048m | 1024m |
+| 4Gi | 1280m | 512m |
 | > 5Gi | 自動スケール | 自動スケール |
 
 ### AMP タスク
