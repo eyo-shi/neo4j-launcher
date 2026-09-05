@@ -452,11 +452,14 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     else:
         data_volume.empty_dir = client.V1EmptyDirVolumeSource()
 
-    data_mount = client.V1VolumeMount(
-        name="neo4j-data",
-        mount_path="/data",
-        sub_path="neo4j-volume" if NEO4J_USE_PVC else "data",
-    )
+    # emptyDir を使用する場合は sub_path を外して /data に直接割り当てる
+    # (PVC 使用時のみ sub_path を設定)
+    data_mount = client.V1VolumeMount(name="neo4j-data", mount_path="/data")
+    if NEO4J_USE_PVC:
+        data_mount.sub_path = "neo4j-volume"
+
+    # logs 用の emptyDir を明示的に復活させて /logs への書き込み拒否を回避
+    logs_mount = client.V1VolumeMount(name="neo4j-logs", mount_path="/logs")
 
     pod_spec = client.V1PodSpec(
         security_context=client.V1PodSecurityContext(
