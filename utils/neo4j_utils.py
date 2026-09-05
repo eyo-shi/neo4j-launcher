@@ -458,25 +458,19 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
     logs_mount = client.V1VolumeMount(name="neo4j-logs", mount_path="/logs")
 
     pod_spec = client.V1PodSpec(
-        # security_context=client.V1PodSecurityContext(
-        #    fs_group=NEO4J_CONTAINER_GID,
-        #    fs_group_change_policy="Always",
-        #),
+        security_context=client.V1PodSecurityContext(
+            fs_group=NEO4J_CONTAINER_GID,
+        ),
         containers=[
             client.V1Container(
                 name="neo4j",
                 image=NEO4J_IMAGE,
                 image_pull_policy="IfNotPresent",
-                #security_context=client.V1SecurityContext(
-                #    allow_privilege_escalation=False,
-                #    run_as_non_root=True,
-                #    run_as_user=NEO4J_CONTAINER_UID,
-                #    run_as_group=NEO4J_CONTAINER_GID,
-                #),
-                #security_context=client.V1SecurityContext(
-                #    run_as_non_root=False,
-                #    allow_privilege_escalation=True,
-                #),
+                security_context=client.V1SecurityContext(
+                    run_as_user=NEO4J_CONTAINER_UID,
+                    run_as_group=NEO4J_CONTAINER_GID,
+                    run_as_non_root=True,
+                ),
                 ports=[
                     client.V1ContainerPort(
                         container_port=7687, name="bolt"
