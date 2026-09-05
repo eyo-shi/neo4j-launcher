@@ -416,7 +416,7 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
         ),
         # server.memory.pagecache.size -> pagecache_size (one underscore; dot only).
         client.V1EnvVar(
-            name="NEO4J_server_memory_pagecache_size",
+            name="NEO4J_server_memory_pagecache__size",
             value=memory["pagecache"],
         ),
     ]
@@ -586,7 +586,7 @@ def _deployment_config_matches() -> bool:
         limits.get("memory") == get_neo4j_memory()
         and env_by_name.get("NEO4J_server_memory_heap_max__size")
         == expected["heap_max"]
-        and env_by_name.get("NEO4J_server_memory_pagecache_size")
+        and env_by_name.get("NEO4J_server_memory_pagecache__size")
         == expected["pagecache"]
         and _deployment_uses_pvc(deployment) == NEO4J_USE_PVC
         and _deployment_plugins_env(deployment) == _neo4j_plugins_json()
