@@ -461,16 +461,6 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
             fs_group=NEO4J_CONTAINER_GID,
             fs_group_change_policy="Always",
         ),
-        init_containers=[
-            client.V1Container(
-                name="fix-data-permissions",
-                image=NEO4J_IMAGE,
-                image_pull_policy="IfNotPresent",
-                command=["chown", "-R", "7474:7474", "/data"],
-                security_context=client.V1SecurityContext(run_as_user=0),
-                volume_mounts=[data_mount],
-            )
-        ],
         containers=[
             client.V1Container(
                 name="neo4j",
