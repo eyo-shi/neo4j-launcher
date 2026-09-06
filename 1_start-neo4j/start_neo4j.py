@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, urlparse
 
 from utils.neo4j_utils import (
+    build_proxied_browser_path,
     get_cml_application_base_url,
     get_cml_proxy_discovery_json,
     get_connection_info,
@@ -15,6 +16,7 @@ from utils.neo4j_utils import (
     get_proxy_unavailable_reason,
     invalidate_neo4j_http_cache,
     is_k8s_proxy_http_url,
+    is_neo4j_http_up,
     browser_asset_proxy_paths,
     prepare_neo4j_http_request,
     rewrite_proxy_location_header,
@@ -315,6 +317,14 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         accept = self.headers.get("Accept", "")
         if "application/json" in accept:
             self._serve_discovery_json()
+            return
+
+        if is_neo4j_http_up():
+            browser_path = build_proxied_browser_path()
+            self.send_response(302)
+            self.send_header("Location", browser_path)
+            self._send_cors_headers()
+            self.end_headers()
             return
 
         info = get_connection_info()

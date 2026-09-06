@@ -1279,6 +1279,26 @@ def get_deployment_diagnostics() -> dict:
     return diagnostics
 
 
+def _ensure_neo4j_service_exists() -> None:
+    if _get_service() is not None:
+        return
+    service_api_instance = client.CoreV1Api()
+    namespace = get_current_namespace()
+    print(f"Creating missing Neo4j service {get_neo4j_service_name()}...")
+    _create_with_conflict_retry(
+        lambda: service_api_instance.create_namespaced_service(
+            namespace=namespace,
+            body=create_service_spec_for_neo4j(),
+        ),
+        _get_service,
+        lambda: service_api_instance.delete_namespaced_service(
+            name=get_neo4j_service_name(),
+            namespace=namespace,
+        ),
+        get_neo4j_service_name(),
+    )
+
+
 def deploy_neo4j_server() -> None:
     deployment = _get_deployment()
     if (
@@ -1290,6 +1310,7 @@ def deploy_neo4j_server() -> None:
             "Neo4j is already reachable with current configuration. "
             "Skipping deploy."
         )
+        _ensure_neo4j_service_exists()
         return
 
     if deployment is not None and not _deployment_config_matches():
@@ -1301,9 +1322,6 @@ def deploy_neo4j_server() -> None:
         )
 
     _ensure_clean_slate()
-
-    service_api_instance = client.CoreV1Api()
-    namespace = get_current_namespace()
 
     deployment = _get_deployment()
     if deployment is None:
@@ -1320,19 +1338,7 @@ def deploy_neo4j_server() -> None:
         print(f"Using existing deployment {get_deployment_name()}.")
         _log_deployment_rollout_status("using existing deployment")
 
-    if _get_service() is None:
-        _create_with_conflict_retry(
-            lambda: service_api_instance.create_namespaced_service(
-                namespace=namespace,
-                body=create_service_spec_for_neo4j(),
-            ),
-            _get_service,
-            lambda: service_api_instance.delete_namespaced_service(
-                name=get_neo4j_service_name(),
-                namespace=namespace,
-            ),
-            get_neo4j_service_name(),
-        )
+    _ensure_neo4j_service_exists()
 
     _log_deployment_rollout_status("after deploy")
 
@@ -1678,16 +1684,30 @@ def wait_for_neo4j_server(
 
 
 def get_external_endpoints() -> dict:
-    service_api = client.CoreV1Api()
-    service = service_api.read_namespaced_service(
-        name=get_neo4j_service_name(),
-        namespace=get_current_namespace(),
-    )
+    namespace = get_current_namespace()
+    service_name = get_neo4j_service_name()
+    fallback = {
+        "service_type": "ClusterIP",
+        "internal_bolt": f"bolt://{service_name}.{namespace}:7687",
+        "internal_browser": f"http://{service_name}.{namespace}:7474",
+        "external_bolt": None,
+        "external_browser": None,
+    }
+    try:
+        service_api = client.CoreV1Api()
+        service = service_api.read_namespaced_service(
+            name=service_name,
+            namespace=namespace,
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            return fallback
+        raise
 
     endpoints = {
         "service_type": service.spec.type,
-        "internal_bolt": f"bolt://{get_neo4j_service_name()}.{get_current_namespace()}:7687",
-        "internal_browser": f"http://{get_neo4j_service_name()}.{get_current_namespace()}:7474",
+        "internal_bolt": fallback["internal_bolt"],
+        "internal_browser": fallback["internal_browser"],
         "external_bolt": None,
         "external_browser": None,
     }
@@ -2223,7 +2243,23 @@ def get_connection_info() -> dict:
                 "Waiting for Neo4j Kubernetes service to be created. "
                 f"Details: {exc}"
             )
-        return info
+        endpoints = {
+            "service_type": None,
+            "internal_bolt": f"bolt://{get_neo4j_service_name()}.{get_current_namespace()}:7687",
+            "internal_browser": f"http://{get_neo4j_service_name()}.{get_current_namespace()}:7474",
+            "external_bolt": None,
+            "external_browser": None,
+        }
+
+    if diagnostics.get("service_status") == "not found":
+        warning = (
+            "Neo4j Kubernetes Service is missing. "
+            "The launcher will recreate it automatically."
+        )
+        if not info.get("message"):
+            info["message"] = warning
+        elif warning not in info["message"]:
+            info["message"] = f"{info['message']} {warning}"
 
     info.update(
         {
