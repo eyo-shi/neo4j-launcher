@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -80,6 +81,7 @@ NEO4J_USE_PVC = _env_bool("NEO4J_USE_PVC", default=False)
 NEO4J_STARTUP_TIMEOUT_SECONDS = int(
     os.getenv("NEO4J_STARTUP_TIMEOUT_SECONDS") or "1200"
 )
+_cached_neo4j_http_base: str | None = None
 NEO4J_CONTAINER_UID = 7474
 NEO4J_CONTAINER_GID = 7474
 DEFAULT_NEO4J_USERNAME = "neo4j"
@@ -480,8 +482,6 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                 name="neo4j",
                 image=NEO4J_IMAGE,
                 image_pull_policy="IfNotPresent",
-                # run_as_user/run_as_group のみ指定 (run_as_non_root は書かない)
-                command=["/bin/sh", "-c", "sleep infinity"],
                 security_context=client.V1SecurityContext(
                     run_as_user=NEO4J_CONTAINER_UID,
                     run_as_group=NEO4J_CONTAINER_GID,
@@ -573,7 +573,6 @@ def _deployment_security_context_matches(deployment: client.V1Deployment) -> boo
         and container_sc is not None
         and container_sc.run_as_user == NEO4J_CONTAINER_UID
         and container_sc.run_as_group == NEO4J_CONTAINER_GID
-        and container_sc.run_as_non_root is True
     )
 
 
@@ -987,7 +986,12 @@ def _get_neo4j_pod_logs(tail_lines: int = 200) -> str | None:
                 if log:
                     suffix = " (previous)" if previous else ""
                     log_parts.append(f"=== neo4j{suffix} ===\n{log}")
-            except ApiException:
+            except ApiException as exc:
+                if exc.status == 403:
+                    log_parts.append(
+                        f"=== neo4j{' (previous)' if previous else ''} ===\n"
+                        f"pod log read forbidden (RBAC): {_format_k8s_error(exc)}"
+                    )
                 continue
         if len(log_parts) > 1:
             return "\n\n".join(log_parts)
@@ -1326,8 +1330,101 @@ def wait_for_neo4j_http(
     raise RuntimeError("Neo4j HTTP endpoint is not reachable.")
 
 
+def _k8s_api_host() -> str:
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    return f"https://{host}:{port}"
+
+
+def _k8s_ssl_context() -> ssl.SSLContext:
+    return ssl.create_default_context(
+        cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    )
+
+
+def _k8s_bearer_token() -> str:
+    with open("/var/run/secrets/kubernetes.io/serviceaccount/token", "r") as f:
+        return f.read().strip()
+
+
+def is_k8s_proxy_http_url(url: str) -> bool:
+    return "/pods/" in url and ":7474/proxy" in url
+
+
+def prepare_neo4j_http_request(
+    url: str,
+    data: bytes | None = None,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+) -> urllib.request.Request:
+    request = urllib.request.Request(url, data=data, method=method)
+    for header, value in (headers or {}).items():
+        request.add_header(header, value)
+    if is_k8s_proxy_http_url(url):
+        request.add_header("Authorization", f"Bearer {_k8s_bearer_token()}")
+    return request
+
+
+def urlopen_neo4j_http(
+    request: urllib.request.Request,
+    timeout: float = 10,
+):
+    if is_k8s_proxy_http_url(request.full_url):
+        return urllib.request.urlopen(
+            request,
+            timeout=timeout,
+            context=_k8s_ssl_context(),
+        )
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def _neo4j_k8s_proxy_base_urls() -> list[str]:
+    namespace = get_current_namespace()
+    urls: list[str] = []
+    for pod in _list_neo4j_pods():
+        if pod.status.phase != "Running" or not pod.metadata.name:
+            continue
+        urls.append(
+            f"{_k8s_api_host()}/api/v1/namespaces/{namespace}/pods/"
+            f"{pod.metadata.name}:7474/proxy"
+        )
+    return urls
+
+
+def _deployment_is_ready() -> bool:
+    deployment = _get_deployment()
+    if deployment is None:
+        return False
+    available = deployment.status.available_replicas or 0
+    desired = deployment.spec.replicas or 0
+    return desired > 0 and available >= desired
+
+
+def _log_neo4j_connectivity_diagnostics() -> None:
+    lines = ["Neo4j connectivity diagnostics:"]
+    for label, url in [
+        ("k8s_proxy", _neo4j_k8s_proxy_base_urls()[:1]),
+        ("pod_ip", [f"http://{ip}:7474" for ip in _neo4j_pod_ips()[:1]]),
+        ("service", _internal_browser_url_candidates()[:1]),
+    ]:
+        if not url:
+            lines.append(f"  {label}: unavailable")
+            continue
+        target = url[0] if isinstance(url, list) else url
+        try:
+            request = prepare_neo4j_http_request(
+                f"{target.rstrip('/')}/",
+                method="GET",
+            )
+            with urlopen_neo4j_http(request, timeout=5) as response:
+                lines.append(f"  {label}: ok (HTTP {response.status})")
+        except Exception as exc:
+            lines.append(f"  {label}: failed ({exc})")
+    print("\n".join(lines))
+
+
 def _all_http_url_candidates() -> list[str]:
-    candidates: list[str] = []
+    candidates: list[str] = list(_neo4j_k8s_proxy_base_urls())
     for pod_ip in _neo4j_pod_ips():
         candidates.append(f"http://{pod_ip}:7474")
     candidates.extend(_internal_browser_url_candidates())
@@ -1376,7 +1473,7 @@ def _is_query_api_ready(timeout: float = 10.0) -> bool:
     token = base64.b64encode(
         f"{credentials['username']}:{credentials['password']}".encode()
     ).decode()
-    request = urllib.request.Request(
+    request = prepare_neo4j_http_request(
         f"{base.rstrip('/')}/db/neo4j/query/v2",
         data=json.dumps({"statement": "RETURN 1 AS n"}).encode(),
         method="POST",
@@ -1387,20 +1484,28 @@ def _is_query_api_ready(timeout: float = 10.0) -> bool:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urlopen_neo4j_http(request, timeout=timeout) as response:
             return 200 <= response.status < 300
     except Exception:
         return False
 
 
 def _first_reachable_http_url() -> str | None:
-    if not service_exists():
+    global _cached_neo4j_http_base
+    if _cached_neo4j_http_base:
+        return _cached_neo4j_http_base
+    if not _list_neo4j_pods() and not service_exists():
         return None
     for candidate in _all_http_url_candidates():
         try:
-            urllib.request.urlopen(f"{candidate.rstrip('/')}/", timeout=5)
-            return candidate
-        except (urllib.error.URLError, TimeoutError, OSError):
+            request = prepare_neo4j_http_request(
+                f"{candidate.rstrip('/')}/",
+                method="GET",
+            )
+            with urlopen_neo4j_http(request, timeout=5):
+                _cached_neo4j_http_base = candidate
+                return candidate
+        except (urllib.error.URLError, TimeoutError, OSError, Exception):
             continue
     return None
 
@@ -1475,7 +1580,14 @@ def wait_for_neo4j_server(
             )
         if attempt % 6 == 5:
             _log_deployment_rollout_status("waiting for Neo4j readiness")
+            _log_neo4j_connectivity_diagnostics()
         time.sleep(sleep_duration)
+    if _deployment_is_ready() and _first_reachable_http_url():
+        print(
+            "Neo4j Deployment is ready and HTTP is reachable via Kubernetes API "
+            "proxy. Continuing startup."
+        )
+        return
     diagnostics = get_deployment_diagnostics()
     raise RuntimeError(
         "Neo4j server is not ready yet. Max retries exceeded. "
@@ -1638,14 +1750,15 @@ def build_proxied_browser_path(_external_bolt: str | None = None) -> str:
 
 
 def fetch_neo4j_discovery_payload() -> dict | None:
-    internal = get_internal_browser_url()
+    internal = _first_reachable_http_url()
     if not internal:
         return None
     try:
-        with urllib.request.urlopen(
+        request = prepare_neo4j_http_request(
             f"{internal.rstrip('/')}/",
-            timeout=10,
-        ) as response:
+            method="GET",
+        )
+        with urlopen_neo4j_http(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
@@ -1913,7 +2026,7 @@ def _bootstrap_neo4j() -> None:
     print(
         "  neo4j_security_context="
         f"runAsUser={NEO4J_CONTAINER_UID}, runAsGroup={NEO4J_CONTAINER_GID}, "
-        f"fsGroup={NEO4J_CONTAINER_GID}, fsGroupChangePolicy=Always, runAsNonRoot=true"
+        f"fsGroup={NEO4J_CONTAINER_GID}, fsGroupChangePolicy=Always"
     )
     print(
         "  neo4j_listen="

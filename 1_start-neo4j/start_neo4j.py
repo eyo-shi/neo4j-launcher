@@ -12,7 +12,10 @@ from utils.neo4j_utils import (
     get_connection_info,
     get_internal_browser_url,
     get_proxy_unavailable_reason,
+    prepare_neo4j_http_request,
     run_neo4j_supervisor,
+    urlopen_neo4j_http,
+    is_k8s_proxy_http_url,
 )
 
 HOP_BY_HOP_HEADERS = {
@@ -232,7 +235,7 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length else None
 
-        request = urllib.request.Request(target_url, data=body, method=method)
+        request = prepare_neo4j_http_request(target_url, data=body, method=method)
         forwarded_host = None
         forwarded_proto = None
         for header, value in self.headers.items():
@@ -244,10 +247,12 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                     forwarded_host = value
                 if header_lower == "x-forwarded-proto":
                     forwarded_proto = value
+                continue
             request.add_header(header, value)
 
         parsed_target = urlparse(target_url)
-        request.add_header("Host", parsed_target.netloc)
+        if not is_k8s_proxy_http_url(target_url):
+            request.add_header("Host", parsed_target.netloc)
         if not forwarded_host:
             forwarded_host = self.headers.get("Host")
         if forwarded_host:
@@ -257,7 +262,7 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         request.add_header("X-Forwarded-Proto", forwarded_proto)
 
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urlopen_neo4j_http(request, timeout=120) as response:
                 body_bytes = response.read()
                 path = urlparse(self.path).path
                 content_type = response.headers.get("Content-Type", "")
