@@ -140,6 +140,17 @@ def _render_status_page(info: dict) -> str:
 
 
 class Neo4jLauncherHandler(BaseHTTPRequestHandler):
+    def send_error(self, code, message=None, explain=None):
+        self.log_error("code %d, message %s", code, message)
+        self.send_response(code, message)
+        self.send_header('Connection', 'close')
+        self._send_cors_headers()
+        self.end_headers()
+        if explain is None:
+            explain = self.responses.get(code, ('', ''))[1]
+        body = explain.encode('utf-8')
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         self._handle_request("GET")
 
@@ -195,6 +206,7 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
             print(f"Redirecting outdated query params from {self.path} to {redirect_target}")
             self.send_response(302)
             self.send_header("Location", redirect_target)
+            self._send_cors_headers()
             self.end_headers()
             return True
 
@@ -288,15 +300,22 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def _serve_root(self) -> None:
+        accept = self.headers.get("Accept", "")
+        if "application/json" in accept:
+            self._serve_discovery_json()
+            return
+
         info = get_connection_info()
         browser_path = info.get("proxied_browser_path")
         if info.get("status") == "running" and browser_path:
             self.send_response(302)
             self.send_header("Location", browser_path)
+            self._send_cors_headers()
             self.end_headers()
             return
         self._serve_status_page()
