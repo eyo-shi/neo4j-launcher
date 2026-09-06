@@ -403,10 +403,6 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
             value="0.0.0.0:7687",
         ),
         client.V1EnvVar(
-            name="NEO4J_server_http_x__forward__enabled",
-            value="true",
-        ),
-        client.V1EnvVar(
             name="NEO4J_server_memory_heap_initial__size",
             value=memory["heap_initial"],
         ),
@@ -573,6 +569,8 @@ def _deployment_listen_config_matches(env_by_name: dict[str, str]) -> bool:
         env_by_name.get("NEO4J_server_default__listen__address") == "0.0.0.0"
         and "NEO4J_server_directories_data" not in env_by_name
         and "NEO4J_server_directories_logs" not in env_by_name
+        # Typo variant maps to invalid server.http.x_forward_enabled in Neo4j 2026.
+        and "NEO4J_server_http_x__forward__enabled" not in env_by_name
     )
 
 
@@ -1563,10 +1561,6 @@ def _patch_neo4j_advertised_addresses(
         env_by_name["NEO4J_server_http_advertised__address"] = client.V1EnvVar(
             name="NEO4J_server_http_advertised__address",
             value=http_address,
-        )
-        env_by_name["NEO4J_server_http_x__forward__enabled"] = client.V1EnvVar(
-            name="NEO4J_server_http_x__forward__enabled",
-            value="true",
         )
     else:
         env_by_name.pop("NEO4J_server_http_advertised__address", None)
