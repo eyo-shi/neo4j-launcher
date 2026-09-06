@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import socket
@@ -195,14 +196,26 @@ def get_neo4j_bolt_uri() -> str:
     return f"bolt://{service_name}.{namespace}.svc.cluster.local:7687"
 
 
+def _neo4j_pod_ips() -> list[str]:
+    ips: list[str] = []
+    for pod in _list_neo4j_pods():
+        if pod.status.phase == "Running" and pod.status.pod_ip:
+            ips.append(pod.status.pod_ip)
+    return ips
+
+
 def _bolt_host_candidates() -> list[str]:
     service_name = get_neo4j_service_name()
     namespace = get_current_namespace()
-    return [
-        f"{service_name}.{namespace}.svc.cluster.local",
-        f"{service_name}.{namespace}",
-        service_name,
-    ]
+    hosts = list(_neo4j_pod_ips())
+    hosts.extend(
+        [
+            f"{service_name}.{namespace}.svc.cluster.local",
+            f"{service_name}.{namespace}",
+            service_name,
+        ]
+    )
+    return hosts
 
 
 def _is_bolt_port_open(timeout: float = 3.0) -> bool:
@@ -483,14 +496,14 @@ def create_deployment_spec_for_neo4j() -> client.V1Deployment:
                     limits={"cpu": "2", "memory": neo4j_memory},
                 ),
                 startup_probe=client.V1Probe(
-                    tcp_socket=client.V1TCPSocketAction(port=7687),
+                    http_get=client.V1HTTPGetAction(path="/", port=7474),
                     period_seconds=10,
                     failure_threshold=60,
                 ),
                 readiness_probe=client.V1Probe(
-                    tcp_socket=client.V1TCPSocketAction(port=7687),
+                    http_get=client.V1HTTPGetAction(path="/", port=7474),
                     period_seconds=10,
-                    failure_threshold=20,
+                    failure_threshold=30,
                 ),
                 volume_mounts=[data_mount],
             )
@@ -1314,7 +1327,10 @@ def wait_for_neo4j_http(
 
 
 def _all_http_url_candidates() -> list[str]:
-    candidates = list(_internal_browser_url_candidates())
+    candidates: list[str] = []
+    for pod_ip in _neo4j_pod_ips():
+        candidates.append(f"http://{pod_ip}:7474")
+    candidates.extend(_internal_browser_url_candidates())
     core_api = client.CoreV1Api()
     try:
         endpoints = core_api.read_namespaced_endpoints(
@@ -1337,19 +1353,7 @@ def _all_http_url_candidates() -> list[str]:
     return unique_candidates
 
 
-def _first_reachable_http_url() -> str | None:
-    if not service_exists():
-        return None
-    for candidate in _all_http_url_candidates():
-        try:
-            urllib.request.urlopen(f"{candidate.rstrip('/')}/", timeout=5)
-            return candidate
-        except (urllib.error.URLError, TimeoutError, OSError):
-            continue
-    return None
-
-
-def is_neo4j_server_up() -> bool:
+def _verify_bolt_connectivity() -> bool:
     credentials = get_neo4j_credentials()
     try:
         with GraphDatabase.driver(
@@ -1363,6 +1367,50 @@ def is_neo4j_server_up() -> bool:
         return False
 
 
+def _is_query_api_ready(timeout: float = 10.0) -> bool:
+    base = _first_reachable_http_url()
+    if not base:
+        return False
+
+    credentials = get_neo4j_credentials()
+    token = base64.b64encode(
+        f"{credentials['username']}:{credentials['password']}".encode()
+    ).decode()
+    request = urllib.request.Request(
+        f"{base.rstrip('/')}/db/neo4j/query/v2",
+        data=json.dumps({"statement": "RETURN 1 AS n"}).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Basic {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def _first_reachable_http_url() -> str | None:
+    if not service_exists():
+        return None
+    for candidate in _all_http_url_candidates():
+        try:
+            urllib.request.urlopen(f"{candidate.rstrip('/')}/", timeout=5)
+            return candidate
+        except (urllib.error.URLError, TimeoutError, OSError):
+            continue
+    return None
+
+
+def is_neo4j_server_up() -> bool:
+    if _is_query_api_ready():
+        return True
+    return _verify_bolt_connectivity()
+
+
 def wait_for_neo4j_server(
     max_retries: int | None = None,
     sleep_duration: int = 10,
@@ -1373,69 +1421,61 @@ def wait_for_neo4j_server(
     if deploy_started_at is None:
         deploy_started_at = time.time()
 
-    credentials = get_neo4j_credentials()
     consecutive_fatal_pod_failures = 0
-    with GraphDatabase.driver(
-        credentials["uri"],
-        auth=(credentials["username"], credentials["password"]),
-        connection_timeout=5,
-    ) as driver:
-        for attempt in range(max_retries):
-            pod_status = _get_neo4j_pod_status_text()
-            fatal_status = _neo4j_pod_fatal_failure_status()
-            if fatal_status:
-                consecutive_fatal_pod_failures += 1
-                logs = _get_neo4j_pod_logs(tail_lines=200)
-                events = _get_recent_deployment_events()
-                print(
-                    "Neo4j pod fatal failure detected "
-                    f"({consecutive_fatal_pod_failures}): {fatal_status}"
+    for attempt in range(max_retries):
+        pod_status = _get_neo4j_pod_status_text()
+        fatal_status = _neo4j_pod_fatal_failure_status()
+        if fatal_status:
+            consecutive_fatal_pod_failures += 1
+            logs = _get_neo4j_pod_logs(tail_lines=200)
+            events = _get_recent_deployment_events()
+            print(
+                "Neo4j pod fatal failure detected "
+                f"({consecutive_fatal_pod_failures}): {fatal_status}"
+            )
+            if logs:
+                print(f"Recent pod logs/events:\n{logs[-8000:]}")
+            else:
+                print("Recent pod logs/events: unavailable")
+            if events:
+                print(f"Recent deployment events:\n{events[-2000:]}")
+            if consecutive_fatal_pod_failures >= POD_FATAL_FAILURE_THRESHOLD:
+                raise RuntimeError(
+                    "Neo4j pod failed to start. "
+                    f"Pod status: {fatal_status}"
                 )
-                if logs:
-                    print(f"Recent pod logs/events:\n{logs[-8000:]}")
-                else:
-                    print("Recent pod logs/events: unavailable")
-                if events:
-                    print(f"Recent deployment events:\n{events[-2000:]}")
-                if consecutive_fatal_pod_failures >= POD_FATAL_FAILURE_THRESHOLD:
-                    raise RuntimeError(
-                        "Neo4j pod failed to start. "
-                        f"Pod status: {fatal_status}"
-                    )
-                time.sleep(sleep_duration)
-                continue
-            consecutive_fatal_pod_failures = 0
+            time.sleep(sleep_duration)
+            continue
+        consecutive_fatal_pod_failures = 0
 
-            if is_neo4j_http_up():
-                print(
-                    f"Neo4j HTTP is up; waiting for Bolt "
-                    f"({attempt + 1}/{max_retries})"
-                )
-                time.sleep(sleep_duration)
-                continue
+        if _is_query_api_ready():
+            print(
+                f"Neo4j Query API is ready ({attempt + 1}/{max_retries})"
+            )
+            return
 
-            if not _is_bolt_port_open():
-                print(
-                    f"Neo4j Bolt port is not open yet "
-                    f"({attempt + 1}/{max_retries}); "
-                    f"pod_status={pod_status}"
-                )
-                if attempt % 6 == 5:
-                    _log_deployment_rollout_status("waiting for Bolt port")
-                time.sleep(sleep_duration)
-                continue
+        if _verify_bolt_connectivity():
+            print(f"Neo4j Bolt is ready ({attempt + 1}/{max_retries})")
+            return
 
-            try:
-                driver.verify_connectivity()
-                return
-            except Exception as exc:
-                print(
-                    f"Neo4j server is not ready yet "
-                    f"({attempt + 1}/{max_retries}): {exc}"
-                )
-                if attempt % 6 == 5:
-                    print(f"Current pod status: {pod_status}")
-                time.sleep(sleep_duration)
+        if is_neo4j_http_up():
+            print(
+                f"Neo4j HTTP is up; waiting for Query API "
+                f"({attempt + 1}/{max_retries}); pod_status={pod_status}"
+            )
+        elif _is_bolt_port_open():
+            print(
+                f"Neo4j Bolt port is open; waiting for handshake "
+                f"({attempt + 1}/{max_retries}); pod_status={pod_status}"
+            )
+        else:
+            print(
+                f"Neo4j is not reachable yet "
+                f"({attempt + 1}/{max_retries}); pod_status={pod_status}"
+            )
+        if attempt % 6 == 5:
+            _log_deployment_rollout_status("waiting for Neo4j readiness")
+        time.sleep(sleep_duration)
     diagnostics = get_deployment_diagnostics()
     raise RuntimeError(
         "Neo4j server is not ready yet. Max retries exceeded. "
@@ -1773,37 +1813,37 @@ def get_connection_info() -> dict:
         )
 
     http_ready = is_neo4j_http_up()
-    bolt_ready = is_neo4j_server_up()
+    query_ready = _is_query_api_ready()
+    bolt_ready = _verify_bolt_connectivity()
 
-    if not bolt_ready or not http_ready:
-        if info["status"] == "starting" and _pod_is_in_failure_state(pod_status):
-            info["status"] = "error"
-        if not info.get("message"):
-            if bolt_ready and not http_ready:
-                info["message"] = (
-                    "Neo4j Bolt is up but HTTP is not ready yet. "
-                    "Browser proxy will work once HTTP responds on port 7474."
-                )
-            elif http_ready and not bolt_ready:
-                info["message"] = (
-                    "Neo4j HTTP is up but Bolt is not ready yet. "
-                    "APOC/GDS plugin download can take several minutes on first start."
-                )
-            else:
-                info["message"] = get_proxy_unavailable_reason()
-        if http_ready:
-            info["proxied_browser_path"] = build_proxied_browser_path()
-            info["http_api_connect_url"] = get_cml_application_base_url()
-            if info["http_api_connect_url"]:
-                info["http_api_connect_url"] = f"{info['http_api_connect_url']}/"
+    if query_ready or bolt_ready:
+        info["status"] = "running"
+        info["message"] = None
+        info["proxied_browser_path"] = build_proxied_browser_path()
+        info["http_api_connect_url"] = get_cml_application_base_url()
+        if info["http_api_connect_url"]:
+            info["http_api_connect_url"] = f"{info['http_api_connect_url']}/"
         return info
 
-    info["status"] = "running"
-    info["message"] = None
-    info["proxied_browser_path"] = build_proxied_browser_path()
-    info["http_api_connect_url"] = get_cml_application_base_url()
-    if info["http_api_connect_url"]:
-        info["http_api_connect_url"] = f"{info['http_api_connect_url']}/"
+    if info["status"] == "starting" and _pod_is_in_failure_state(pod_status):
+        info["status"] = "error"
+    if not info.get("message"):
+        if http_ready:
+            info["message"] = (
+                "Neo4j HTTP is up but Query API is not ready yet. "
+                "Neo4j may still be starting (first boot can take several minutes)."
+            )
+        elif bolt_ready:
+            info["message"] = (
+                "Neo4j Bolt is up but HTTP/Query API is not ready yet."
+            )
+        else:
+            info["message"] = get_proxy_unavailable_reason()
+    if http_ready:
+        info["proxied_browser_path"] = build_proxied_browser_path()
+        info["http_api_connect_url"] = get_cml_application_base_url()
+        if info["http_api_connect_url"]:
+            info["http_api_connect_url"] = f"{info['http_api_connect_url']}/"
     return info
 
 
