@@ -14,8 +14,10 @@ from utils.neo4j_utils import (
     get_proxy_unavailable_reason,
     invalidate_neo4j_http_cache,
     is_k8s_proxy_http_url,
+    browser_asset_proxy_paths,
     prepare_neo4j_http_request,
     rewrite_proxy_location_header,
+    rewrite_proxy_response_body,
     run_neo4j_supervisor,
     urlopen_neo4j_http,
 )
@@ -34,6 +36,8 @@ HOP_BY_HOP_HEADERS = {
 STRIPPED_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {
     "content-encoding",
     "content-length",
+    "content-security-policy",
+    "content-security-policy-report-only",
 }
 
 FORWARDED_HEADERS = {
@@ -261,92 +265,126 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            target_url = urljoin(
-                f"{internal_browser.rstrip('/')}/",
-                self.path.lstrip("/"),
-            )
-            request = prepare_neo4j_http_request(
-                target_url, data=body, method=method
-            )
-            forwarded_host = None
-            forwarded_proto = None
-            for header, value in self.headers.items():
-                header_lower = header.lower()
-                if (
-                    header_lower in HOP_BY_HOP_HEADERS
-                    or header_lower == "host"
-                    or header_lower == "accept-encoding"
-                ):
-                    continue
-                if header_lower in FORWARDED_HEADERS:
-                    if header_lower == "x-forwarded-host":
-                        forwarded_host = value
-                    if header_lower == "x-forwarded-proto":
-                        forwarded_proto = value
-                    continue
-                request.add_header(header, value)
+            proxy_paths = browser_asset_proxy_paths(self.path)
+            last_http_error: urllib.error.HTTPError | None = None
 
-            request.add_header("Accept-Encoding", "identity")
-
-            parsed_target = urlparse(target_url)
-            if not is_k8s_proxy_http_url(target_url):
-                request.add_header("Host", parsed_target.netloc)
-            if not forwarded_host:
-                forwarded_host = self.headers.get("Host")
-            if forwarded_host:
-                request.add_header("X-Forwarded-Host", forwarded_host)
-            if not forwarded_proto:
-                forwarded_proto = "https"
-            request.add_header("X-Forwarded-Proto", forwarded_proto)
-
-            try:
-                with urlopen_neo4j_http(request, timeout=120) as response:
-                    body_bytes = response.read()
-                    path = urlparse(self.path).path
-                    content_type = response.headers.get("Content-Type", "")
+            for proxy_index, proxy_path in enumerate(proxy_paths):
+                target_url = urljoin(
+                    f"{internal_browser.rstrip('/')}/",
+                    proxy_path.lstrip("/"),
+                )
+                request = prepare_neo4j_http_request(
+                    target_url, data=body, method=method
+                )
+                forwarded_host = None
+                forwarded_proto = None
+                for header, value in self.headers.items():
+                    header_lower = header.lower()
                     if (
-                        method == "GET"
-                        and path in ("", "/")
-                        and "application/json" in content_type
+                        header_lower in HOP_BY_HOP_HEADERS
+                        or header_lower == "host"
+                        or header_lower == "accept-encoding"
                     ):
-                        rewritten = get_cml_proxy_discovery_json()
-                        if rewritten is not None:
-                            body_bytes = rewritten.encode("utf-8")
+                        continue
+                    if header_lower in FORWARDED_HEADERS:
+                        if header_lower == "x-forwarded-host":
+                            forwarded_host = value
+                        if header_lower == "x-forwarded-proto":
+                            forwarded_proto = value
+                        continue
+                    request.add_header(header, value)
 
-                    self._send_proxy_response(
-                        response.status, response.headers, body_bytes
+                request.add_header("Accept-Encoding", "identity")
+
+                parsed_target = urlparse(target_url)
+                if not is_k8s_proxy_http_url(target_url):
+                    request.add_header("Host", parsed_target.netloc)
+                if not forwarded_host:
+                    forwarded_host = self.headers.get("Host")
+                if forwarded_host:
+                    request.add_header("X-Forwarded-Host", forwarded_host)
+                if not forwarded_proto:
+                    forwarded_proto = "https"
+                request.add_header("X-Forwarded-Proto", forwarded_proto)
+                request.add_header("X-Forwarded-Port", "443")
+
+                try:
+                    with urlopen_neo4j_http(request, timeout=120) as response:
+                        body_bytes = response.read()
+                        path = urlparse(self.path).path
+                        content_type = response.headers.get("Content-Type", "")
+                        if (
+                            method == "GET"
+                            and path in ("", "/")
+                            and "application/json" in content_type
+                        ):
+                            rewritten = get_cml_proxy_discovery_json()
+                            if rewritten is not None:
+                                body_bytes = rewritten.encode("utf-8")
+
+                        body_bytes = rewrite_proxy_response_body(
+                            body_bytes, content_type
+                        )
+                        self._send_proxy_response(
+                            response.status, response.headers, body_bytes
+                        )
+                    return
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 404 and proxy_index + 1 < len(proxy_paths):
+                        print(
+                            f"Browser asset not found at {proxy_path}; "
+                            f"retrying alternate Neo4j path."
+                        )
+                        last_http_error = exc
+                        continue
+                    error_body = exc.read()
+                    error_content_type = exc.headers.get("Content-Type", "")
+                    error_body = rewrite_proxy_response_body(
+                        error_body, error_content_type
                     )
-                return
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read()
-                self._send_proxy_response(exc.code, exc.headers, error_body)
-                return
-            except (urllib.error.URLError, OSError, ConnectionResetError) as exc:
-                if attempt == 0:
-                    print(
-                        f"Proxy connection failed for {method} {self.path}: "
-                        f"{exc}. Refreshing Neo4j HTTP route and retrying."
+                    self._send_proxy_response(exc.code, exc.headers, error_body)
+                    return
+                except (urllib.error.URLError, OSError, ConnectionResetError) as exc:
+                    if attempt == 0:
+                        print(
+                            f"Proxy connection failed for {method} {self.path}: "
+                            f"{exc}. Refreshing Neo4j HTTP route and retrying."
+                        )
+                        invalidate_neo4j_http_cache()
+                        break
+                    self.send_error(
+                        503,
+                        "Neo4j Browser is not ready yet. Please wait and retry.",
                     )
-                    invalidate_neo4j_http_cache()
-                    continue
-                self.send_error(
-                    503,
-                    "Neo4j Browser is not ready yet. Please wait and retry.",
+                    return
+                except Exception as exc:
+                    if attempt == 0:
+                        print(
+                            f"Proxy error for {method} {self.path}: {exc}. "
+                            "Refreshing Neo4j HTTP route and retrying."
+                        )
+                        invalidate_neo4j_http_cache()
+                        break
+                    print(f"Proxy error for {method} {self.path}: {exc}")
+                    self.send_error(
+                        502, f"Failed to proxy Neo4j Browser request: {exc}"
+                    )
+                    return
+
+            if last_http_error is not None:
+                error_body = last_http_error.read()
+                error_content_type = last_http_error.headers.get("Content-Type", "")
+                error_body = rewrite_proxy_response_body(
+                    error_body, error_content_type
+                )
+                self._send_proxy_response(
+                    last_http_error.code, last_http_error.headers, error_body
                 )
                 return
-            except Exception as exc:
-                if attempt == 0:
-                    print(
-                        f"Proxy error for {method} {self.path}: {exc}. "
-                        "Refreshing Neo4j HTTP route and retrying."
-                    )
-                    invalidate_neo4j_http_cache()
-                    continue
-                print(f"Proxy error for {method} {self.path}: {exc}")
-                self.send_error(
-                    502, f"Failed to proxy Neo4j Browser request: {exc}"
-                )
-                return
+            if attempt == 0:
+                invalidate_neo4j_http_cache()
+                continue
+            return
 
     def log_message(self, format: str, *args) -> None:
         return

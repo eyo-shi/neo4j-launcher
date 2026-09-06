@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import socket
 import ssl
 import time
@@ -440,6 +441,18 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
                 value=proxy_http_address,
             )
         )
+        env.extend(
+            [
+                client.V1EnvVar(
+                    name="NEO4J_server_http_x__forward_enabled",
+                    value="true",
+                ),
+                client.V1EnvVar(
+                    name="NEO4J_server_http_x__forward_private__ips__enabled",
+                    value="true",
+                ),
+            ]
+        )
     plugins_json = _neo4j_plugins_json()
     if plugins_json:
         env.append(client.V1EnvVar(name="NEO4J_PLUGINS", value=plugins_json))
@@ -590,8 +603,24 @@ def _deployment_listen_config_matches(env_by_name: dict[str, str]) -> bool:
         env_by_name.get("NEO4J_server_default__listen__address") == "0.0.0.0"
         and "NEO4J_server_directories_data" not in env_by_name
         and "NEO4J_server_directories_logs" not in env_by_name
-        # Typo variant maps to invalid server.http.x_forward_enabled in Neo4j 2026.
+        # Invalid typo variant from earlier releases.
         and "NEO4J_server_http_x__forward__enabled" not in env_by_name
+    )
+
+
+def _deployment_proxy_config_matches(env_by_name: dict[str, str]) -> bool:
+    proxy_http_address = _cml_proxy_http_advertised_address()
+    if not proxy_http_address:
+        return (
+            "NEO4J_server_http_advertised__address" not in env_by_name
+            and "NEO4J_server_http_x__forward_enabled" not in env_by_name
+        )
+    return (
+        env_by_name.get("NEO4J_server_http_advertised__address")
+        == proxy_http_address
+        and env_by_name.get("NEO4J_server_http_x__forward_enabled") == "true"
+        and env_by_name.get("NEO4J_server_http_x__forward_private__ips__enabled")
+        == "true"
     )
 
 
@@ -618,8 +647,7 @@ def _deployment_config_matches() -> bool:
         and _deployment_security_context_matches(deployment)
         and _deployment_volume_layout_matches(deployment)
         and _deployment_listen_config_matches(env_by_name)
-        and env_by_name.get("NEO4J_server_http_advertised__address")
-        == _cml_proxy_http_advertised_address()
+        and _deployment_proxy_config_matches(env_by_name)
     )
 
 
@@ -1864,6 +1892,179 @@ def rewrite_proxy_location_header(location: str) -> str:
     ):
         return f"{base_url}{suffix}"
     return location
+
+
+_BROWSER_ASSET_RE = re.compile(
+    r'(?P<attr>src|href)=(["\'])/(?P<path>(?:assets/|static/)?'
+    r'(?:index-|rolldown-runtime\.|vendor-|neo4j-browser)[^"\']*)'
+    r'(?P<quote>["\'])'
+)
+
+
+def _is_browser_root_static_path(path: str) -> bool:
+    path_only = path.split("?", 1)[0]
+    if path_only.startswith(("/browser", "/db", "/launcher", "/health")):
+        return False
+    if path_only.startswith(("/assets/", "/static/")):
+        return True
+    basename = path_only.rsplit("/", 1)[-1]
+    if not basename:
+        return False
+    lower = basename.lower()
+    if lower.startswith(
+        ("index-", "rolldown-runtime.", "vendor-", "neo4j-browser.")
+    ):
+        return True
+    if lower == "neo4j-browser.bundle.js":
+        return True
+    if lower.endswith(
+        (".js", ".css", ".map", ".woff2", ".woff", ".ttf", ".svg", ".ico", ".png")
+    ):
+        return True
+    return False
+
+
+def remap_browser_asset_path(path: str) -> str:
+    path_only, _, query = path.partition("?")
+    if not _is_browser_root_static_path(path_only):
+        return path
+    if path_only.startswith("/browser"):
+        return path
+    remapped = (
+        f"/browser{path_only}"
+        if path_only.startswith("/")
+        else f"/browser/{path_only}"
+    )
+    return f"{remapped}?{query}" if query else remapped
+
+
+def browser_asset_proxy_paths(path: str) -> list[str]:
+    path_only, _, query = path.partition("?")
+    candidates: list[str] = []
+    for candidate in (
+        remap_browser_asset_path(path),
+        (
+            f"/browser{path_only}"
+            if path_only.startswith("/")
+            else f"/browser/{path_only}"
+        ),
+    ):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    if "/assets/" in path_only:
+        stripped = path_only.replace("/assets/", "/", 1)
+        stripped_candidate = (
+            f"/browser{stripped}"
+            if stripped.startswith("/")
+            else f"/browser/{stripped}"
+        )
+        stripped_with_query = (
+            f"{stripped_candidate}?{query}" if query else stripped_candidate
+        )
+        if stripped_with_query not in candidates:
+            candidates.append(stripped_with_query)
+    return candidates
+
+
+def _rewrite_browser_html_asset_refs(text: str) -> str:
+    return _BROWSER_ASSET_RE.sub(
+        lambda match: (
+            f'{match.group("attr")}={match.group(2)}/browser/{match.group("path")}'
+            f'{match.group("quote")}'
+        ),
+        text,
+    )
+
+
+def _proxy_body_url_replacements() -> list[tuple[str, str]]:
+    base = get_cml_application_base_url()
+    if not base:
+        return []
+
+    https_base = base.rstrip("/")
+    prefixes: set[str] = set()
+    try:
+        endpoints = get_external_endpoints()
+        for key in ("internal_browser", "external_browser"):
+            endpoint = endpoints.get(key)
+            if endpoint:
+                prefixes.add(endpoint.rstrip("/"))
+    except Exception:
+        pass
+
+    service_name = get_neo4j_service_name()
+    namespace = get_current_namespace()
+    prefixes.update(
+        {
+            f"http://{service_name}.{namespace}.svc.cluster.local:7474",
+            f"http://{service_name}.{namespace}:7474",
+            f"http://{service_name}:7474",
+            f"https://{service_name}.{namespace}.svc.cluster.local:7474",
+            f"https://{service_name}.{namespace}:7474",
+            f"https://{service_name}:7474",
+        }
+    )
+    for pod_ip in _neo4j_pod_ips():
+        prefixes.add(f"http://{pod_ip}:7474")
+        prefixes.add(f"https://{pod_ip}:7474")
+
+    proxy_http_address = _cml_proxy_http_advertised_address()
+    if proxy_http_address:
+        prefixes.add(f"http://{proxy_http_address}")
+        prefixes.add(f"https://{proxy_http_address}")
+
+    replacements: list[tuple[str, str]] = []
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        replacements.append((prefix, https_base))
+        if prefix.startswith("https://"):
+            replacements.append((prefix.replace("https://", "http://", 1), https_base))
+    return replacements
+
+
+def rewrite_proxy_response_body(body_bytes: bytes, content_type: str | None) -> bytes:
+    if not content_type:
+        return body_bytes
+    lowered = content_type.lower()
+    if not any(
+        token in lowered
+        for token in (
+            "text/html",
+            "javascript",
+            "text/css",
+            "application/json",
+            "text/plain",
+        )
+    ):
+        return body_bytes
+
+    try:
+        text = body_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return body_bytes
+
+    for old, new in _proxy_body_url_replacements():
+        text = text.replace(old, new)
+
+    if "text/html" in lowered:
+        text = _rewrite_browser_html_asset_refs(text)
+        if "/browser" in text.lower():
+            base = get_cml_application_base_url()
+            if base and "<base " not in text.lower():
+                base_href = f'{base.rstrip("/")}/browser/'
+                if "<head>" in text:
+                    text = text.replace(
+                        "<head>",
+                        f'<head><base href="{base_href}">',
+                        1,
+                    )
+                elif "<HEAD>" in text:
+                    text = text.replace(
+                        "<HEAD>",
+                        f'<HEAD><base href="{base_href}">',
+                        1,
+                    )
+
+    return text.encode("utf-8")
 
 
 def get_cml_proxy_discovery_json() -> str | None:
