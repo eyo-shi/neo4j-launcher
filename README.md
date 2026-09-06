@@ -93,7 +93,7 @@ Launcher（親 Pod）と Neo4j Pod（子 Pod）は同じノード上で並行動
 
 アプリケーションは CML のヘルスチェック要件を満たすため、`CDSW_APP_PORT` で `/health` を公開します。接続情報は `/launcher` に表示されます。Status が **running** になると、Neo4j Browser から接続できます。
 
-**Neo4j Browser** はステータスページの **Open Neo4j Browser**（`/browser/`）から開いてください。接続画面ではプロトコルに `https://` を選び、**HTTP API Connect URL**（例: `https://neo4j-launcher-<engine-id>.<domain>/`）をそのまま入力してください。
+**Neo4j Browser** はステータスページの **Open Neo4j Browser**（`/browser/`）から開いてください。接続画面ではプロトコルに `https://` を選び、**HTTP API Connect URL**（例: `https://neo4j-launcher-<engine-id>.<domain>/`、末尾 `/` 必須）をそのまま入力してください。**Connect with SSO は OFF** にしてください。接続前に `https://<your-app>/launcher/discovery` が JSON を返すことも確認できます。
 
 ## 接続方法
 

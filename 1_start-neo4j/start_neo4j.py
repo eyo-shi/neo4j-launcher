@@ -1,4 +1,5 @@
 import html
+import json
 import os
 import threading
 import urllib.error
@@ -7,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, urlparse
 
 from utils.neo4j_utils import (
+    get_cml_proxy_discovery_json,
     get_connection_info,
     get_internal_browser_url,
     get_proxy_unavailable_reason,
@@ -31,6 +33,12 @@ FORWARDED_HEADERS = {
     "x-forwarded-port",
     "forwarded",
 }
+
+CORS_ALLOW_HEADERS = (
+    "Authorization, Accept, Content-Type, Neo4j-Database, "
+    "Neo4j-Transaction-Id, Neo4j-Transaction-Timeout, "
+    "X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto"
+)
 
 
 def _render_status_page(info: dict) -> str:
@@ -108,7 +116,7 @@ def _render_status_page(info: dict) -> str:
 <body>
   <h1>Neo4j Launcher</h1>
   <p>Deployment status is shown here. Neo4j Browser connects through this application URL using the HTTPS Query API.</p>
-  <p>Wait until <strong>Status</strong> becomes <code>running</code>, then open <strong>Open Neo4j Browser</strong>. On the connect screen, use protocol <code>https://</code> and paste the full <strong>HTTP API Connect URL</strong> below.</p>
+  <p>Wait until <strong>Status</strong> becomes <code>running</code>, then open <strong>Open Neo4j Browser</strong>. On the connect screen, use protocol <code>https://</code> and paste the full <strong>HTTP API Connect URL</strong> below (must end with <code>/</code>). Keep <strong>Connect with SSO</strong> off.</p>
   <table>
     {''.join(table_rows)}
   </table>
@@ -134,36 +142,62 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
 
     def _handle_request(self, method: str) -> None:
         path = urlparse(self.path).path
+        if method == "OPTIONS":
+            self._serve_cors_preflight()
+            return
         if path in ("/health", "/healthz"):
             self._serve_health_check()
             return
         if path in ("/launcher", "/launcher/"):
             self._serve_status_page()
             return
-        if (
-            path == "/"
-            and method == "GET"
-            and self._should_redirect_root_to_launcher()
-        ):
-            self._redirect_to("/launcher")
+        if path == "/launcher/discovery":
+            self._serve_discovery_json()
             return
         self._proxy_request(method)
 
-    def _should_redirect_root_to_launcher(self) -> bool:
-        # Neo4j Browser Query API discovery uses GET / with Accept */* or
-        # application/json — those must be proxied to Neo4j, not redirected.
-        accept = self.headers.get("Accept", "").lower()
-        if "application/json" in accept:
-            return False
-        first = accept.split(",", 1)[0].strip()
-        return first.startswith("text/html")
+    def _cors_origin(self) -> str:
+        origin = self.headers.get("Origin")
+        if origin:
+            return origin
+        host = self.headers.get("Host")
+        if host:
+            return f"https://{host}"
+        return "*"
 
-    def _redirect_to(self, location: str) -> None:
-        body = f"Redirecting to {location}".encode("utf-8")
-        self.send_response(302)
-        self.send_header("Location", location)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+    def _send_cors_headers(self) -> None:
+        origin = self._cors_origin()
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Credentials", "true")
+        self.send_header("Vary", "Origin")
+
+    def _serve_cors_preflight(self) -> None:
+        requested_headers = self.headers.get(
+            "Access-Control-Request-Headers", CORS_ALLOW_HEADERS
+        )
+        self.send_response(204)
+        self._send_cors_headers()
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+        )
+        self.send_header("Access-Control-Allow-Headers", requested_headers)
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
+
+    def _serve_discovery_json(self) -> None:
+        payload = get_cml_proxy_discovery_json()
+        if payload is None:
+            self.send_error(
+                503,
+                "Neo4j discovery is not available yet. Please wait and retry.",
+            )
+            return
+        body = payload.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -224,23 +258,39 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
 
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
+                body_bytes = response.read()
+                path = urlparse(self.path).path
+                content_type = response.headers.get("Content-Type", "")
+                if (
+                    method == "GET"
+                    and path in ("", "/")
+                    and "application/json" in content_type
+                ):
+                    rewritten = get_cml_proxy_discovery_json()
+                    if rewritten is not None:
+                        body_bytes = rewritten.encode("utf-8")
+
                 self.send_response(response.status)
                 for header, value in response.headers.items():
-                    if header.lower() not in HOP_BY_HOP_HEADERS:
-                        self.send_header(header, value)
+                    header_lower = header.lower()
+                    if header_lower in HOP_BY_HOP_HEADERS:
+                        continue
+                    if header_lower == "content-length":
+                        continue
+                    self.send_header(header, value)
+                self._send_cors_headers()
+                self.send_header("Content-Length", str(len(body_bytes)))
                 self.end_headers()
-                while True:
-                    chunk = response.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+                self.wfile.write(body_bytes)
         except urllib.error.HTTPError as exc:
+            error_body = exc.read()
             self.send_response(exc.code)
             for header, value in exc.headers.items():
                 if header.lower() not in HOP_BY_HOP_HEADERS:
                     self.send_header(header, value)
+            self._send_cors_headers()
             self.end_headers()
-            self.wfile.write(exc.read())
+            self.wfile.write(error_body)
         except urllib.error.URLError as exc:
             self.send_error(
                 503,

@@ -1590,7 +1590,55 @@ def build_proxied_browser_path(_external_bolt: str | None = None) -> str:
 
     # Use HTTPS Query API via the CML application proxy instead of external Bolt.
     connect_url = f"{base_url}/"
-    return f"/browser/?connectURL={quote(connect_url, safe='')}"
+    discovery_url = f"{base_url}/launcher/discovery"
+    return (
+        f"/browser/?connectURL={quote(connect_url, safe='')}"
+        f"&discoveryURL={quote(discovery_url, safe='')}"
+    )
+
+
+def fetch_neo4j_discovery_payload() -> dict | None:
+    internal = get_internal_browser_url()
+    if not internal:
+        return None
+    try:
+        with urllib.request.urlopen(
+            f"{internal.rstrip('/')}/",
+            timeout=10,
+        ) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def rewrite_discovery_payload_for_cml_proxy(data: dict) -> dict:
+    base = get_cml_application_base_url()
+    if not base:
+        return data
+
+    base = base.rstrip("/")
+    from urllib.parse import urlparse
+
+    rewritten: dict = {}
+    for key, value in data.items():
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            parsed = urlparse(value)
+            suffix = parsed.path
+            if parsed.query:
+                suffix += f"?{parsed.query}"
+            rewritten[key] = f"{base}{suffix}"
+        else:
+            rewritten[key] = value
+    if "auth_config" not in rewritten:
+        rewritten["auth_config"] = {"oidc_providers": []}
+    return rewritten
+
+
+def get_cml_proxy_discovery_json() -> str | None:
+    data = fetch_neo4j_discovery_payload()
+    if data is None:
+        return None
+    return json.dumps(rewrite_discovery_payload_for_cml_proxy(data))
 
 
 def _internal_browser_url_candidates() -> list[str]:
