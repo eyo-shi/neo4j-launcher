@@ -186,6 +186,11 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         origin = self._cors_origin()
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Credentials", "true")
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+        )
+        self.send_header("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)
         self.send_header("Vary", "Origin")
 
     def _serve_cors_preflight(self) -> None:
@@ -193,13 +198,16 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
             "Access-Control-Request-Headers", CORS_ALLOW_HEADERS
         )
         self.send_response(204)
-        self._send_cors_headers()
+        origin = self._cors_origin()
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Credentials", "true")
         self.send_header(
             "Access-Control-Allow-Methods",
             "GET, POST, PUT, DELETE, PATCH, OPTIONS",
         )
         self.send_header("Access-Control-Allow-Headers", requested_headers)
         self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Vary", "Origin")
         self.end_headers()
 
     def _serve_discovery_json(self) -> None:
@@ -340,6 +348,11 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                             rewritten = get_cml_proxy_discovery_json()
                             if rewritten is not None:
                                 body_bytes = rewritten.encode("utf-8")
+                            else:
+                                print(
+                                    "WARNING: Failed to rewrite discovery payload "
+                                    "because get_cml_proxy_discovery_json() returned None."
+                                )
 
                         body_bytes = rewrite_proxy_response_body(
                             body_bytes, content_type

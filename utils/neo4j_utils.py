@@ -1839,10 +1839,12 @@ def fetch_neo4j_discovery_payload() -> dict | None:
         request = prepare_neo4j_http_request(
             f"{internal.rstrip('/')}/",
             method="GET",
+            headers={"Accept": "application/json"},
         )
         with urlopen_neo4j_http(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
-    except Exception:
+    except Exception as exc:
+        print(f"Failed to fetch Neo4j discovery payload: {exc}")
         return None
 
 
