@@ -1816,11 +1816,16 @@ def _patch_neo4j_advertised_addresses(
 
 
 def build_proxied_browser_path(_external_bolt: str | None = None) -> str:
-    from urllib.parse import quote
+    from urllib.parse import quote, urlparse, urlunparse
 
     base_url = get_cml_application_base_url()
     if not base_url:
         return "/browser/"
+
+    parsed = urlparse(base_url)
+    if parsed.scheme == "https" and not parsed.port:
+        parsed = parsed._replace(netloc=f"{parsed.hostname}:443")
+        base_url = urlunparse(parsed)
 
     # Use HTTPS Query API via the CML application proxy instead of external Bolt.
     connect_url = f"{base_url}/"
@@ -1853,16 +1858,21 @@ def rewrite_discovery_payload_for_cml_proxy(data: dict) -> dict:
     if not base:
         return data
 
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(base)
+    if parsed.scheme == "https" and not parsed.port:
+        parsed = parsed._replace(netloc=f"{parsed.hostname}:443")
+        base = urlunparse(parsed)
+
     base = base.rstrip("/")
-    from urllib.parse import urlparse
 
     rewritten: dict = {}
     for key, value in data.items():
         if isinstance(value, str) and value.startswith(("http://", "https://")):
-            parsed = urlparse(value)
-            suffix = parsed.path
-            if parsed.query:
-                suffix += f"?{parsed.query}"
+            parsed_val = urlparse(value)
+            suffix = parsed_val.path
+            if parsed_val.query:
+                suffix += f"?{parsed_val.query}"
             rewritten[key] = f"{base}{suffix}"
         else:
             rewritten[key] = value

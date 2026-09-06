@@ -180,13 +180,15 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
 
         current_base = current_base.rstrip("/")
         curr_parsed = urlparse(current_base)
+        if curr_parsed.scheme == "https" and not curr_parsed.port:
+            curr_parsed = curr_parsed._replace(netloc=f"{curr_parsed.hostname}:443")
 
         updated = False
         new_params = []
         for key, value in q_params:
             if key in ("connectURL", "discoveryURL") and value.startswith(("http://", "https://")):
                 val_parsed = urlparse(value)
-                if val_parsed.netloc != curr_parsed.netloc:
+                if val_parsed.hostname != curr_parsed.hostname:
                     new_val_parts = val_parsed._replace(
                         scheme=curr_parsed.scheme,
                         netloc=curr_parsed.netloc
@@ -195,7 +197,12 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                     new_params.append((key, new_value))
                     updated = True
                 else:
-                    new_params.append((key, value))
+                    if val_parsed.scheme == "https" and not val_parsed.port:
+                        val_parsed = val_parsed._replace(netloc=f"{val_parsed.hostname}:443")
+                        new_params.append((key, urlunparse(val_parsed)))
+                        updated = True
+                    else:
+                        new_params.append((key, value))
             else:
                 new_params.append((key, value))
 
