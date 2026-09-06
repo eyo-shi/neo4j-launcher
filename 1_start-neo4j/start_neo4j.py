@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, urlparse
 
 from utils.neo4j_utils import (
+    get_cml_application_base_url,
     get_cml_proxy_discovery_json,
     get_connection_info,
     get_internal_browser_url,
@@ -154,7 +155,54 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self._handle_request("OPTIONS")
 
+    def _maybe_redirect_outdated_query(self) -> bool:
+        parsed = urlparse(self.path)
+        if not parsed.query:
+            return False
+
+        from urllib.parse import parse_qsl, urlencode, urlunparse
+        q_params = parse_qsl(parsed.query)
+
+        current_base = get_cml_application_base_url()
+        if not current_base:
+            return False
+
+        current_base = current_base.rstrip("/")
+        curr_parsed = urlparse(current_base)
+
+        updated = False
+        new_params = []
+        for key, value in q_params:
+            if key in ("connectURL", "discoveryURL") and value.startswith(("http://", "https://")):
+                val_parsed = urlparse(value)
+                if val_parsed.netloc != curr_parsed.netloc:
+                    new_val_parts = val_parsed._replace(
+                        scheme=curr_parsed.scheme,
+                        netloc=curr_parsed.netloc
+                    )
+                    new_value = urlunparse(new_val_parts)
+                    new_params.append((key, new_value))
+                    updated = True
+                else:
+                    new_params.append((key, value))
+            else:
+                new_params.append((key, value))
+
+        if updated:
+            new_query = urlencode(new_params)
+            new_path = parsed._replace(query=new_query)
+            redirect_target = urlunparse(new_path)
+            print(f"Redirecting outdated query params from {self.path} to {redirect_target}")
+            self.send_response(302)
+            self.send_header("Location", redirect_target)
+            self.end_headers()
+            return True
+
+        return False
+
     def _handle_request(self, method: str) -> None:
+        if method == "GET" and self._maybe_redirect_outdated_query():
+            return
         path = urlparse(self.path).path
         if method == "OPTIONS":
             self._serve_cors_preflight()
