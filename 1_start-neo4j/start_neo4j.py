@@ -168,6 +168,9 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         if path == "/launcher/discovery":
             self._serve_discovery_json()
             return
+        if path in ("", "/") and method == "GET":
+            self._serve_root()
+            return
         self._proxy_request(method)
 
     def _cors_origin(self) -> str:
@@ -232,6 +235,16 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_root(self) -> None:
+        info = get_connection_info()
+        browser_path = info.get("proxied_browser_path")
+        if info.get("status") == "running" and browser_path:
+            self.send_response(302)
+            self.send_header("Location", browser_path)
+            self.end_headers()
+            return
+        self._serve_status_page()
+
     def _send_proxy_response(
         self,
         status: int,
@@ -251,22 +264,28 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body_bytes)
 
+    def _proxy_unavailable_response(self, reason: str) -> None:
+        if self.command == "GET":
+            path = urlparse(self.path).path
+            if path.startswith("/browser") or path in ("", "/"):
+                self._serve_status_page()
+                return
+        self.send_error(503, f"Neo4j Browser is not ready yet. {reason}")
+
     def _proxy_request(self, method: str) -> None:
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length else None
 
-        for attempt in range(2):
+        for attempt in range(3):
             internal_browser = get_internal_browser_url()
             if not internal_browser:
                 reason = get_proxy_unavailable_reason()
-                self.send_error(
-                    503,
-                    f"Neo4j Browser is not ready yet. {reason}",
-                )
+                self._proxy_unavailable_response(reason)
                 return
 
             proxy_paths = browser_asset_proxy_paths(self.path)
             last_http_error: urllib.error.HTTPError | None = None
+            last_connection_error: Exception | None = None
 
             for proxy_index, proxy_path in enumerate(proxy_paths):
                 target_url = urljoin(
@@ -345,16 +364,22 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                     self._send_proxy_response(exc.code, exc.headers, error_body)
                     return
                 except (urllib.error.URLError, OSError, ConnectionResetError) as exc:
-                    if attempt == 0:
+                    last_connection_error = exc
+                    if proxy_index + 1 < len(proxy_paths):
                         print(
-                            f"Proxy connection failed for {method} {self.path}: "
-                            f"{exc}. Refreshing Neo4j HTTP route and retrying."
+                            f"Proxy connection failed for {method} {proxy_path}: "
+                            f"{exc}. Trying alternate Neo4j path."
                         )
+                        continue
+                    print(
+                        f"Proxy connection failed for {method} {self.path}: "
+                        f"{exc}."
+                    )
+                    if attempt < 2:
                         invalidate_neo4j_http_cache()
                         break
-                    self.send_error(
-                        503,
-                        "Neo4j Browser is not ready yet. Please wait and retry.",
+                    self._proxy_unavailable_response(
+                        f"Connection failed: {exc}. Please wait and retry."
                     )
                     return
                 except Exception as exc:
@@ -381,7 +406,16 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                     last_http_error.code, last_http_error.headers, error_body
                 )
                 return
-            if attempt == 0:
+            if last_connection_error is not None and attempt < 2:
+                invalidate_neo4j_http_cache()
+                continue
+            if last_connection_error is not None:
+                self._proxy_unavailable_response(
+                    f"Connection failed: {last_connection_error}. "
+                    "Please wait and retry."
+                )
+                return
+            if attempt < 2:
                 invalidate_neo4j_http_cache()
                 continue
             return

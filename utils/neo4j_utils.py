@@ -1391,6 +1391,18 @@ def is_k8s_proxy_http_url(url: str) -> bool:
     return "/pods/" in url and ":7474/proxy" in url
 
 
+class _NoRedirectHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _cml_proxy_http_host_header() -> str | None:
+    advertised = _cml_proxy_http_advertised_address()
+    if not advertised:
+        return None
+    return advertised.split(":", 1)[0]
+
+
 def prepare_neo4j_http_request(
     url: str,
     data: bytes | None = None,
@@ -1402,6 +1414,9 @@ def prepare_neo4j_http_request(
         request.add_header(header, value)
     if is_k8s_proxy_http_url(url):
         request.add_header("Authorization", f"Bearer {_k8s_bearer_token()}")
+        host_header = _cml_proxy_http_host_header()
+        if host_header:
+            request.add_header("Host", host_header)
     return request
 
 
@@ -1409,13 +1424,15 @@ def urlopen_neo4j_http(
     request: urllib.request.Request,
     timeout: float = 10,
 ):
+    handlers = [_NoRedirectHTTPRedirectHandler()]
     if is_k8s_proxy_http_url(request.full_url):
-        return urllib.request.urlopen(
-            request,
-            timeout=timeout,
-            context=_k8s_ssl_context(),
+        opener = urllib.request.build_opener(
+            *handlers,
+            urllib.request.HTTPSHandler(context=_k8s_ssl_context()),
         )
-    return urllib.request.urlopen(request, timeout=timeout)
+    else:
+        opener = urllib.request.build_opener(*handlers)
+    return opener.open(request, timeout=timeout)
 
 
 def _neo4j_k8s_proxy_base_urls() -> list[str]:
@@ -1940,6 +1957,11 @@ def remap_browser_asset_path(path: str) -> str:
 
 def browser_asset_proxy_paths(path: str) -> list[str]:
     path_only, _, query = path.partition("?")
+    if path_only in ("", "/"):
+        browser_root = "/browser/"
+        if query:
+            browser_root = f"/browser/?{query}"
+        return [browser_root, "/", "/browser/"]
     candidates: list[str] = []
     for candidate in (
         remap_browser_asset_path(path),
