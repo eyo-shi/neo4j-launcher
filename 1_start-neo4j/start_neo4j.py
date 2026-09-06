@@ -140,14 +140,23 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         if path in ("/launcher", "/launcher/"):
             self._serve_status_page()
             return
-        if path == "/" and method == "GET" and self._accepts_html():
+        if (
+            path == "/"
+            and method == "GET"
+            and self._should_redirect_root_to_launcher()
+        ):
             self._redirect_to("/launcher")
             return
         self._proxy_request(method)
 
-    def _accepts_html(self) -> bool:
-        accept = self.headers.get("Accept", "")
-        return "text/html" in accept or accept.startswith("*/*")
+    def _should_redirect_root_to_launcher(self) -> bool:
+        # Neo4j Browser Query API discovery uses GET / with Accept */* or
+        # application/json — those must be proxied to Neo4j, not redirected.
+        accept = self.headers.get("Accept", "").lower()
+        if "application/json" in accept:
+            return False
+        first = accept.split(",", 1)[0].strip()
+        return first.startswith("text/html")
 
     def _redirect_to(self, location: str) -> None:
         body = f"Redirecting to {location}".encode("utf-8")
