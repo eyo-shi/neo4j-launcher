@@ -13,10 +13,11 @@ from utils.neo4j_utils import (
     get_internal_browser_url,
     get_proxy_unavailable_reason,
     invalidate_neo4j_http_cache,
+    is_k8s_proxy_http_url,
     prepare_neo4j_http_request,
+    rewrite_proxy_location_header,
     run_neo4j_supervisor,
     urlopen_neo4j_http,
-    is_k8s_proxy_http_url,
 )
 
 HOP_BY_HOP_HEADERS = {
@@ -28,6 +29,11 @@ HOP_BY_HOP_HEADERS = {
     "trailers",
     "transfer-encoding",
     "upgrade",
+}
+
+STRIPPED_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {
+    "content-encoding",
+    "content-length",
 }
 
 FORWARDED_HEADERS = {
@@ -222,6 +228,25 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_proxy_response(
+        self,
+        status: int,
+        headers,
+        body_bytes: bytes,
+    ) -> None:
+        self.send_response(status)
+        for header, value in headers.items():
+            header_lower = header.lower()
+            if header_lower in STRIPPED_RESPONSE_HEADERS:
+                continue
+            if header_lower == "location":
+                value = rewrite_proxy_location_header(value)
+            self.send_header(header, value)
+        self._send_cors_headers()
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
     def _proxy_request(self, method: str) -> None:
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length else None
@@ -247,7 +272,11 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
             forwarded_proto = None
             for header, value in self.headers.items():
                 header_lower = header.lower()
-                if header_lower in HOP_BY_HOP_HEADERS or header_lower == "host":
+                if (
+                    header_lower in HOP_BY_HOP_HEADERS
+                    or header_lower == "host"
+                    or header_lower == "accept-encoding"
+                ):
                     continue
                 if header_lower in FORWARDED_HEADERS:
                     if header_lower == "x-forwarded-host":
@@ -256,6 +285,8 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                         forwarded_proto = value
                     continue
                 request.add_header(header, value)
+
+            request.add_header("Accept-Encoding", "identity")
 
             parsed_target = urlparse(target_url)
             if not is_k8s_proxy_http_url(target_url):
@@ -282,28 +313,13 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
                         if rewritten is not None:
                             body_bytes = rewritten.encode("utf-8")
 
-                    self.send_response(response.status)
-                    for header, value in response.headers.items():
-                        header_lower = header.lower()
-                        if header_lower in HOP_BY_HOP_HEADERS:
-                            continue
-                        if header_lower == "content-length":
-                            continue
-                        self.send_header(header, value)
-                    self._send_cors_headers()
-                    self.send_header("Content-Length", str(len(body_bytes)))
-                    self.end_headers()
-                    self.wfile.write(body_bytes)
+                    self._send_proxy_response(
+                        response.status, response.headers, body_bytes
+                    )
                 return
             except urllib.error.HTTPError as exc:
                 error_body = exc.read()
-                self.send_response(exc.code)
-                for header, value in exc.headers.items():
-                    if header.lower() not in HOP_BY_HOP_HEADERS:
-                        self.send_header(header, value)
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(error_body)
+                self._send_proxy_response(exc.code, exc.headers, error_body)
                 return
             except (urllib.error.URLError, OSError, ConnectionResetError) as exc:
                 if attempt == 0:

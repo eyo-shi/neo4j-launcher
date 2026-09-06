@@ -432,6 +432,14 @@ def _neo4j_container_env(credentials: dict) -> list[client.V1EnvVar]:
             value=memory["pagecache"],
         ),
     ]
+    proxy_http_address = _cml_proxy_http_advertised_address()
+    if proxy_http_address:
+        env.append(
+            client.V1EnvVar(
+                name="NEO4J_server_http_advertised__address",
+                value=proxy_http_address,
+            )
+        )
     plugins_json = _neo4j_plugins_json()
     if plugins_json:
         env.append(client.V1EnvVar(name="NEO4J_PLUGINS", value=plugins_json))
@@ -610,6 +618,8 @@ def _deployment_config_matches() -> bool:
         and _deployment_security_context_matches(deployment)
         and _deployment_volume_layout_matches(deployment)
         and _deployment_listen_config_matches(env_by_name)
+        and env_by_name.get("NEO4J_server_http_advertised__address")
+        == _cml_proxy_http_advertised_address()
     )
 
 
@@ -1812,6 +1822,48 @@ def rewrite_discovery_payload_for_cml_proxy(data: dict) -> dict:
     if "auth_config" not in rewritten:
         rewritten["auth_config"] = {"oidc_providers": []}
     return rewritten
+
+
+def rewrite_proxy_location_header(location: str) -> str:
+    base = get_cml_application_base_url()
+    if not base or not location:
+        return location
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(location)
+    if not parsed.scheme or not parsed.netloc:
+        return location
+
+    base_url = base.rstrip("/")
+    suffix = parsed.path or "/"
+    if parsed.query:
+        suffix += f"?{parsed.query}"
+    if parsed.fragment:
+        suffix += f"#{parsed.fragment}"
+
+    internal_hosts: set[str] = set()
+    try:
+        endpoints = get_external_endpoints()
+        for endpoint in (
+            endpoints.get("internal_browser"),
+            endpoints.get("external_browser"),
+        ):
+            if endpoint:
+                host = urlparse(endpoint).netloc
+                if host:
+                    internal_hosts.add(host)
+    except Exception:
+        pass
+
+    service_name = get_neo4j_service_name()
+    if (
+        parsed.netloc in internal_hosts
+        or service_name in parsed.netloc
+        or parsed.netloc.startswith(f"{service_name}.")
+    ):
+        return f"{base_url}{suffix}"
+    return location
 
 
 def get_cml_proxy_discovery_json() -> str | None:
