@@ -22,6 +22,7 @@ from utils.neo4j_utils import (
     rewrite_proxy_location_header,
     rewrite_proxy_response_body,
     run_neo4j_supervisor,
+    set_request_public_base_url_from_host,
     urlopen_neo4j_http,
 )
 
@@ -168,6 +169,12 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self._handle_request("OPTIONS")
 
+    def _current_request_host(self) -> str | None:
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
+        if not host:
+            return None
+        return host.split(",")[0].strip()
+
     def _maybe_redirect_outdated_query(self) -> bool:
         parsed = urlparse(self.path)
         if not parsed.query:
@@ -176,11 +183,11 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         from urllib.parse import parse_qsl, urlencode, urlunparse
         q_params = parse_qsl(parsed.query)
 
-        current_base = get_cml_application_base_url()
-        if not current_base:
+        request_host = self._current_request_host()
+        if not request_host:
             return False
 
-        current_base = current_base.rstrip("/")
+        current_base = f"https://{request_host}".rstrip("/")
         curr_parsed = urlparse(current_base)
         if curr_parsed.scheme == "https" and not curr_parsed.port:
             curr_parsed = curr_parsed._replace(netloc=f"{curr_parsed.hostname}:443")
@@ -222,6 +229,9 @@ class Neo4jLauncherHandler(BaseHTTPRequestHandler):
         return False
 
     def _handle_request(self, method: str) -> None:
+        request_host = self._current_request_host()
+        if request_host:
+            set_request_public_base_url_from_host(request_host)
         if method == "GET" and self._maybe_redirect_outdated_query():
             return
         path = urlparse(self.path).path

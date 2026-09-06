@@ -4,6 +4,7 @@ import os
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -295,13 +296,36 @@ def get_deployment_name() -> str:
     return f"neo4j-{get_engine_id()}"
 
 
+_request_context = threading.local()
+
+
+def set_request_public_base_url_from_host(host: str | None) -> None:
+    if not host:
+        return
+    host = host.split(",")[0].strip()
+    if host:
+        _request_context.public_base_url = f"https://{host}"
+
+
 def get_cml_application_base_url() -> str | None:
-    domain = os.getenv("CDSW_DOMAIN")
-    engine_id = os.getenv("CDSW_ENGINE_ID")
-    subdomain = os.getenv("NEO4J_LAUNCHER_SUBDOMAIN", "neo4j-launcher")
-    if domain and engine_id:
-        return f"https://{subdomain}-{engine_id}.{domain}"
-    return None
+    cached = getattr(_request_context, "public_base_url", None)
+    if cached:
+        return cached
+
+    override = (os.getenv("NEO4J_LAUNCHER_PUBLIC_URL") or "").strip()
+    if override:
+        return override.rstrip("/")
+
+    domain = (os.getenv("CDSW_DOMAIN") or "").strip()
+    if not domain:
+        return None
+
+    # CML Applications use the configured subdomain, not CDSW_ENGINE_ID.
+    # The randomized suffix (for example neo4j-launcher-qui5z8) is only known
+    # from the browser Host header, so callers without request context should
+    # prefer NEO4J_LAUNCHER_PUBLIC_URL when the default guess is insufficient.
+    subdomain = (os.getenv("NEO4J_LAUNCHER_SUBDOMAIN") or "neo4j-launcher").strip()
+    return f"https://{subdomain}.{domain}"
 
 
 def _cml_proxy_http_advertised_address() -> str | None:
@@ -2345,6 +2369,12 @@ def _bootstrap_neo4j() -> None:
     print(f"  deployment={get_deployment_name()}")
     print(f"  service={get_neo4j_service_name()}")
     print(f"  neo4j_username={get_neo4j_credentials()['username']}")
+    print(f"  cdsw_engine_id={get_engine_id()}")
+    print(f"  cdsw_domain={os.getenv('CDSW_DOMAIN')}")
+    print(
+        "  public_app_url=derived from HTTP Host header per request "
+        f"(startup fallback={get_cml_application_base_url()})"
+    )
     _log_launcher_neo4j_env_diagnostics()
     print(f"  neo4j_password_source={get_neo4j_password_source()}")
     print(
