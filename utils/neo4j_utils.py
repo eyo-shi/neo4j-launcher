@@ -82,6 +82,7 @@ NEO4J_STARTUP_TIMEOUT_SECONDS = int(
     os.getenv("NEO4J_STARTUP_TIMEOUT_SECONDS") or "1200"
 )
 _cached_neo4j_http_base: str | None = None
+_cached_neo4j_http_pod_name: str | None = None
 NEO4J_CONTAINER_UID = 7474
 NEO4J_CONTAINER_GID = 7474
 DEFAULT_NEO4J_USERNAME = "neo4j"
@@ -1304,6 +1305,7 @@ def stop_neo4j_server() -> None:
 
 
 def reset_neo4j_server() -> None:
+    invalidate_neo4j_http_cache()
     try:
         stop_neo4j_server()
     except Exception as exc:
@@ -1490,10 +1492,33 @@ def _is_query_api_ready(timeout: float = 10.0) -> bool:
         return False
 
 
+def _running_neo4j_pod_name() -> str | None:
+    for pod in _list_neo4j_pods():
+        if pod.status.phase == "Running" and pod.metadata.name:
+            return pod.metadata.name
+    return None
+
+
+def invalidate_neo4j_http_cache() -> None:
+    global _cached_neo4j_http_base, _cached_neo4j_http_pod_name
+    _cached_neo4j_http_base = None
+    _cached_neo4j_http_pod_name = None
+
+
+def _http_cache_is_valid() -> bool:
+    if not _cached_neo4j_http_base:
+        return False
+    if not is_k8s_proxy_http_url(_cached_neo4j_http_base):
+        return True
+    current_pod = _running_neo4j_pod_name()
+    return bool(current_pod and current_pod == _cached_neo4j_http_pod_name)
+
+
 def _first_reachable_http_url() -> str | None:
-    global _cached_neo4j_http_base
-    if _cached_neo4j_http_base:
+    global _cached_neo4j_http_base, _cached_neo4j_http_pod_name
+    if _http_cache_is_valid():
         return _cached_neo4j_http_base
+    invalidate_neo4j_http_cache()
     if not _list_neo4j_pods() and not service_exists():
         return None
     for candidate in _all_http_url_candidates():
@@ -1504,6 +1529,8 @@ def _first_reachable_http_url() -> str | None:
             )
             with urlopen_neo4j_http(request, timeout=5):
                 _cached_neo4j_http_base = candidate
+                if is_k8s_proxy_http_url(candidate):
+                    _cached_neo4j_http_pod_name = _running_neo4j_pod_name()
                 return candidate
         except (urllib.error.URLError, TimeoutError, OSError, Exception):
             continue
@@ -2064,18 +2091,12 @@ def _bootstrap_neo4j() -> None:
 
     wait_for_external_endpoint()
     try:
-        configure_connectivity_addresses()
-        if not is_neo4j_server_up():
-            wait_for_neo4j_server(max_retries=30)
-        try:
-            wait_for_neo4j_http(max_retries=60)
-        except RuntimeError as exc:
-            print(
-                f"Warning: {exc} Browser proxy will become available once "
-                "Neo4j HTTP responds on port 7474."
-            )
-    except Exception as exc:
-        print(f"Failed to finalize Neo4j connectivity: {exc}")
+        wait_for_neo4j_http(max_retries=60)
+    except RuntimeError as exc:
+        print(
+            f"Warning: {exc} Browser proxy will become available once "
+            "Neo4j HTTP responds on port 7474."
+        )
     print_connection_info()
 
 
